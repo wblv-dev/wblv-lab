@@ -40,10 +40,11 @@ def _slice_rows(out, limit, action):
 
 @mcp.tool()
 def lab_hosts() -> str:
-    """List every WBLV lab host from the 1Password registry as JSON. For each host: vendor (live from
-    the router's ARP), role, access mechanism, reachability, and a REAL liveness test — `alive:true`
-    means a read-only auth actually SUCCEEDED (not just that it's listed). Call this FIRST to see what
-    you can actually reach before querying a specific host."""
+    """List the lab inventory as JSON, sourced from OPNsense host entries (the authoritative IPAM).
+    Per host: ip, mac, role, has_creds, and TWO liveness signals — `reach` (mgmt-port/ICMP heartbeat:
+    is it up on the network) and `auth` (did a READ-ONLY login/query actually succeed: true/false, or
+    null where there are no creds / no read-only interface). Plus an `ipam_drift` check (inventory vs
+    live ARP). Call this FIRST to see what you can actually reach before querying a specific host."""
     return _run(["hosts", "--json"])
 
 @mcp.tool()

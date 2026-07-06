@@ -129,21 +129,16 @@ for name in sorted(inventory):
     ip, mac, descr, fqdn = inv["ip"], inv["mac"], inv["descr"], inv["fqdn"]
     role = role_of(name)
     access, port, verb = ROLE_PROFILE.get(role, ("host / no mgmt tool", None, "—"))
-    iid = cred_item.get(name)                      # read-only cred, if one exists
-    cred_title = next((i["title"] for i in items if i["id"] == iid), None) if iid else None
+    iid = cred_item.get(name)                             # read-only cred, if one exists
     port_open = nc_open(ip, port) if (port and ip) else False
-    up = port_open or (ping_ok(ip) if ip else False)
+    reach = port_open or (ping_ok(ip) if ip else False)   # REACH: heartbeat (mgmt port OR ICMP)
     if iid and port_open and role in ROLE_PROFILE and role != "tplink-ap":
-        ok, detail = alive(role, ip, iid)          # authenticated read-only check
-    elif up:
-        ok, detail = (None, "up (ICMP); no reachable read-only interface"
-                      + (f" — port {port} closed" if port else ""))
+        auth = alive(role, ip, iid)[0]                    # AUTH: did a read-only login/query succeed?
     else:
-        ok, detail = (False, "unreachable")
-    rows.append({"host": name, "fqdn": fqdn, "cred_item": cred_title,
-                 "vendor": vendor.get(ip) or None, "role": role or "?", "ip": ip or None, "mac": mac or None,
-                 "access": access, "has_creds": bool(iid), "reachable": up, "alive": ok,
-                 "detail": detail, "drift": drift_of(ip, mac), "descr": descr or None, "use": verb})
+        auth = None                                       # no creds / no read-only interface → n/a
+    rows.append({"host": name, "fqdn": fqdn, "ip": ip or None, "mac": mac or None,
+                 "role": role or "?", "has_creds": bool(iid), "reach": reach, "auth": auth,
+                 "use": verb, "drift": drift_of(ip, mac)})
 
 issues = [f"{r['host']}: {r['drift']}" for r in rows if r["drift"] != "ok"]
 drift_summary = {"checked": len(rows), "ok": sum(1 for r in rows if r["drift"] == "ok"), "issues": issues}
@@ -152,16 +147,14 @@ if JSON:
     print(json.dumps({"vault": VAULT, "source": "OPNsense Dnsmasq host entries",
                       "ipam_drift": drift_summary, "hosts": rows}, indent=2))
 else:
-    def flag(r):
-        if r["alive"] is True: return "ALIVE"
-        if r["alive"] is False: return "DOWN"
-        return "?"
+    R = lambda b: "up" if b else "down"
+    A = lambda v: "ok" if v is True else ("fail" if v is False else "—")
     print(f"inventory: OPNsense host entries   creds: {VAULT} (read-only, by hostname)")
-    hdr = f"{'HOST':<10}{'ROLE':<14}{'IP':<14}{'CRED':<6}{'LIVE':<7}{'DETAIL'}"
+    print("REACH = mgmt-port/ICMP heartbeat   AUTH = read-only login (ok / fail / — = no creds)")
+    hdr = f"{'HOST':<10}{'IP':<15}{'MAC':<20}{'REACH':<7}{'AUTH'}"
     print(hdr); print("-" * len(hdr))
     for r in rows:
-        print(f"{r['host']:<10}{r['role']:<14}{(r['ip'] or '—'):<14}{('yes' if r['has_creds'] else '—'):<6}{flag(r):<7}{r['detail']}")
-        if r["drift"] != "ok": print(f"{'':<10}⚠ {r['drift']}")
+        print(f"{r['host']:<10}{(r['ip'] or '—'):<15}{(r['mac'] or '—'):<20}{R(r['reach']):<7}{A(r['auth'])}")
     print("-" * len(hdr))
     print(f"IPAM: {drift_summary['ok']}/{drift_summary['checked']} inventory entries consistent with live ARP"
           + (f"   ⚠ {'; '.join(issues)}" if issues else "   ✓"))
