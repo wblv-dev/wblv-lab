@@ -1,0 +1,16 @@
+# never commit secrets / tokens
+op-token
+*.token
+*.env
+.env
+*secret*
+*.pem
+*.key
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# macos
+.DS_Store

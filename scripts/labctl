@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# labctl — READ-ONLY access to the WBLV lab. Creds live in a dedicated 1Password vault (auto-detected: the
+# single vault the service account can see). That vault holds ONLY lab hosts, so discovery is naturally scoped.
+#   labctl hosts                 list lab hosts (from 1Password) + type + reachability
+#   labctl opnsense <api/path>   GET an OPNsense read-only API endpoint (default: core/firmware/status)
+#   labctl nas shares            list readable NAS shares
+#   labctl nas ls <folder>       list a NAS folder (read-only)
+#   labctl switch "<show cmd>"   run an Aruba operator (show-only) command
+#   labctl help
+set -uo pipefail
+TF="$HOME/.config/wblv/op-token"
+[ -s "$TF" ] || { echo "labctl: no op token at $TF" >&2; exit 1; }
+export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TF")"
+V="$(op vault list --format json 2>/dev/null | jq -r '.[0].name // empty')"
+[ -n "$V" ] || { echo "labctl: service account sees no vault" >&2; exit 1; }
+HELP(){ grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; }
+item_id(){ op item list --vault "$V" --format json 2>/dev/null | jq -r --arg re "$1" '.[]|select(.title|test($re;"i"))|.id' | head -1; }
+field(){ op item get "$1" --vault "$V" --fields "$2" --reveal 2>/dev/null; }
+item_url(){ op item get "$1" --vault "$V" --format json 2>/dev/null | jq -r '(.urls//[]|map(.href)|join(","))'; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+hosts)
+  exec python3 "$HOME/.config/wblv/lab_discover.py" "$@"
+  ;;
+opnsense|opn)
+  id="$(item_id 'OPN')"; [ -n "$id" ] || { echo "no OPNsense creds in vault" >&2; exit 1; }
+  host="$(item_url "$id" | grep -oE 'https://[0-9.]+' | head -1)"; host="${host:-https://10.19.0.1}"
+  K="$(field "$id" label=Key)"; K="${K#key=}"; S="$(field "$id" label=Secret)"; S="${S#secret=}"
+  curl -sk -u "$K:$S" --max-time 15 "$host/api/${1:-core/firmware/status}"
+  ;;
+nas)
+  id="$(item_id 'NAS')"; [ -n "$id" ] || { echo "no NAS creds in vault" >&2; exit 1; }
+  U="$(field "$id" label=username)"; P="$(field "$id" label=password)"; [ -n "$P" ] || P="$(field "$id" label=confirmpassword)"
+  B="https://10.19.10.10:5001/webapi"
+  auth(){ curl -sk -G "$B/entry.cgi" --data-urlencode api=SYNO.API.Auth --data-urlencode version=7 "$@" --max-time 15; }
+  SID="$(auth --data-urlencode method=login --data-urlencode account="$U" --data-urlencode passwd="$P" --data-urlencode session=FileStation --data-urlencode format=sid | jq -r '.data.sid//empty')"
+  [ -n "$SID" ] || { echo "NAS login failed" >&2; exit 1; }
+  fs(){ curl -sk -G "$B/entry.cgi" --data-urlencode api=SYNO.FileStation.List --data-urlencode version=2 "$@" --data-urlencode _sid="$SID" --max-time 12; }
+  case "${1:-shares}" in
+    shares) fs --data-urlencode method=list_share --data-urlencode additional=perm | jq -r '.data.shares[]?|"  "+.name+"  ("+.path+")  read="+((.additional.perm.acl.read)|tostring)+" write="+((.additional.perm.acl.write)|tostring)';;
+    ls) fs --data-urlencode method=list --data-urlencode folder_path="${2:-/}" | jq -r '.data.files[]?|"  "+(if .isdir then "[d] " else "    " end)+.name';;
+    *) echo "usage: labctl nas {shares|ls <folder>}" >&2;;
+  esac
+  auth --data-urlencode method=logout --data-urlencode session=FileStation --data-urlencode _sid="$SID" >/dev/null 2>&1
+  ;;
+switch|sw)
+  id="$(item_id 'SWT')"; [ -n "$id" ] || { echo "no switch creds in vault" >&2; exit 1; }
+  U=operator   # Aruba operator-level (show-only) login; item username is a label, not the SSH user
+  export SWT_PW="$(field "$id" label=password)"; [ -n "$SWT_PW" ] || export SWT_PW="$(field "$id" 'label=Operator Password')"
+  h="$(item_url "$id" | sed -E 's#https?://##;s#[/,].*##' | head -1)"; h="${h:-10.19.0.177}"
+  "$HOME/.config/wblv/switch_show.py" "$h" "$U" "${@:-show system}"
+  ;;
+help|--help|-h|*) HELP;;
+esac
