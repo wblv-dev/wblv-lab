@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --with pexpect --quiet --script
 """wblv-lab — what is alive in the lab, and how to reach it.
 
 A directory, not a broker. It reports members, their state and their access route, then
@@ -14,6 +14,10 @@ Nothing here is cached and nothing is hardcoded. The only seed is this machine's
 resolver, which is maintained by the network rather than by us.
 """
 import os, sys, json, re, subprocess, time
+try:
+    import pexpect
+except ImportError:
+    pexpect = None   # SSH probes report this rather than failing silently
 from concurrent.futures import ThreadPoolExecutor
 
 TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
@@ -32,8 +36,6 @@ ROLES = {                     # prefix -> (role, how you get in, port to knock o
     "wap": ("tplink-ap",    "web UI :443 (no RO mechanism)",443),
     "pve": ("proxmox",      "REST API :8006",              8006),
 }
-
-SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
 
 # Credentials are held OUT of the member records so they cannot reach stdout. Output rows are
 # built from an explicit whitelist below; a secret must never be one accidental print away.
@@ -226,21 +228,77 @@ def nc_open(host, port, t=3):
 def ping_ok(host, t=2):
     return subprocess.run(["ping", "-c", "1", "-t", str(t), host], capture_output=True).returncode == 0
 
-def ssh_probe(user, host):
-    """Key-only. BatchMode never prompts, so a missing key fails fast instead of hanging, and
-    PreferredAuthentications=publickey stops SSH silently falling back to a password — which
-    would make 'the key works' indistinguishable from 'the password worked'."""
-    r = subprocess.run(["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
-                        "-o", "StrictHostKeyChecking=accept-new",
-                        "-o", "PreferredAuthentications=publickey",
-                        f"{user}@{host}", "echo wblv-ok"],
-                       capture_output=True, text=True, timeout=20)
-    if r.returncode == 0 and "wblv-ok" in r.stdout:
-        return True, "key accepted"
-    err = (r.stderr or "").strip().splitlines()[-1:] or [""]
-    if "publickey" in err[0] or "Permission denied" in err[0]:
-        return False, "key not deployed for this account"
-    return False, err[0][:70] or "ssh failed"
+def ssh_probe(user, host, pw, expect_token, cmd):
+    """Password SSH, one mechanism for every host — consistency over key management.
+
+    PubkeyAuthentication=no and PreferredAuthentications=password force the path we are
+    actually testing: without them SSH may succeed on a key and report a password login that
+    never happened. NumberOfPasswordPrompts=1 makes a bad credential fail rather than retry.
+
+    The password is passed to pexpect at the prompt, never as an argument, so it cannot appear
+    in the process list or in any transcript of the command."""
+    if pexpect is None:
+        return None, "pexpect unavailable (run via uv, not bare python3)"
+    if not pw:
+        return None, "no password field on the 1Password item"
+    args = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10", "-o", "PubkeyAuthentication=no",
+            "-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=password",
+            f"{user}@{host}", cmd]
+    c = pexpect.spawn("ssh", args, encoding="utf-8", timeout=25)
+    try:
+        if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
+            return False, "no password prompt (SSH refused before auth)"
+        c.sendline(pw)
+        i = c.expect([expect_token, r"[Pp]ermission denied", r"[Aa]uthentication failed",
+                      pexpect.EOF, pexpect.TIMEOUT])
+        if i == 0:
+            return True, "login ok"
+        return False, ("credential rejected" if i in (1, 2) else
+                       "connected but no expected response")
+    finally:
+        try: c.close(force=True)
+        except Exception: pass
+
+def aruba_probe(user, host, pw):
+    """ArubaOS does not accept a command as an SSH argument — it opens an interactive session
+    with a banner and a keypress gate. Reaching the prompt IS the proof of login, so the probe
+    stops there rather than running anything.
+
+    The prompt character is the useful part: '>' is operator (show-only), '#' is manager. That
+    reports the PRIVILEGE LEVEL as observed on the device, which is the read-only guarantee
+    demonstrated rather than assumed — and it would catch the account being promoted."""
+    if pexpect is None:
+        return None, "pexpect unavailable (run via uv, not bare python3)"
+    if not pw:
+        return None, "no password field on the 1Password item"
+    opts = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            "-o ConnectTimeout=12 -o PubkeyAuthentication=no "
+            "-o NumberOfPasswordPrompts=1 "
+            "-o PreferredAuthentications=password,keyboard-interactive")
+    c = pexpect.spawn(f"ssh {opts} {user}@{host}", encoding="utf-8",
+                      timeout=25, dimensions=(200, 400))
+    try:
+        if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
+            return False, "no password prompt (SSH refused before auth)"
+        c.sendline(pw)
+        i = c.expect([r"[Pp]ress any key to continue", r"[A-Za-z0-9._\-]+[>#]",
+                      r"[Pp]assword:", r"nvalid", pexpect.EOF, pexpect.TIMEOUT])
+        if i in (2, 3):
+            return False, "credential rejected"
+        if i == 0:
+            c.send("\r")
+            if c.expect([r"[A-Za-z0-9._\-]+[>#]", pexpect.TIMEOUT], timeout=15) != 0:
+                return False, "banner cleared but no prompt"
+        prompt = (c.after or "").strip()
+        level = "manager (#) — EXPECTED OPERATOR" if prompt.endswith("#") else "operator (>)"
+        return True, f"login ok, {level}"
+    finally:
+        try:
+            c.sendline("exit"); c.close(force=True)
+        except Exception:
+            pass
+
 
 def auth_probe(r):
     """A REAL read-only login, using the host's own mechanism. Returns (ok|None, detail).
@@ -270,7 +328,16 @@ def auth_probe(r):
                     "--data-urlencode", f"_sid={sid}"], capture_output=True)
             return (bool(sid), "DSM login ok" if sid else "DSM rejected the credential")
         if r["role"] in ("aruba-switch", "linux"):
-            return ssh_probe(r.get("account") or "claude", host)
+            u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
+            pw = (c.get("password") or c.get("confirmpassword")
+                  or c.get("operator password", "")).removeprefix("password=")
+            if not u:
+                return None, "no username field on the 1Password item"
+            # Prove the session is really established, not merely connected: the switch echoes
+            # its own name, the shell echoes a token we chose.
+            if r["role"] == "aruba-switch":
+                return aruba_probe(u, host, pw)
+            return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok")
         return None, f"no read-only mechanism for role '{r['role']}'"
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
