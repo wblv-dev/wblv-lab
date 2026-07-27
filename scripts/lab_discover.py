@@ -13,6 +13,28 @@ Read-only. Uses nc/curl/ssh (NOT python sockets — macOS Local Network Privacy 
 import os, sys, subprocess, json, re, time
 from concurrent.futures import ThreadPoolExecutor
 
+# --- role model: the ONE place a hostname prefix maps to a device type ---------------------
+# Published via `--roles` so labctl (bash) dispatches from this map rather than duplicating it.
+#
+# ONBOARDING A NEW HOST: add its prefix here, add a ROLE_PROFILE entry, add a branch in labctl's
+# role dispatch, and give it a `WBLV-<HOST> / CLAUDE` read-only item in 1Password. Nothing else —
+# inventory, reachability and the command surface all follow from those four.
+ROLE_BY_PREFIX = {"nas": "synology", "opn": "opnsense", "swt": "aruba-switch", "wap": "tplink-ap", "rpi": "raspberry-pi"}
+ROLE_PROFILE = {
+    "synology":     ("DSM API :5001 + SMB :445",        5001, "labctl nas"),
+    "aruba-switch": ("SSH operator :22 (show-only)",    22,   'labctl switch "<cmd>"'),
+    "opnsense":     ("REST API :443",                   443,  "labctl opnsense <path>"),
+    "tplink-ap":    ("web UI :80/443 (no RO handler)",  443,  "—"),
+    "raspberry-pi": ("SSH :22 (read-only claude)",      22,   'labctl rpi "<cmd>"'),
+}
+def role_of(name): return ROLE_BY_PREFIX.get(name.split("-")[0].lower())
+
+if "--roles" in sys.argv:                 # cheap: answered before any network or 1P work
+    print(json.dumps({"prefix": ROLE_BY_PREFIX,
+                      "profile": {k: {"access": v[0], "port": v[1], "use": v[2]}
+                                  for k, v in ROLE_PROFILE.items()}}, indent=2))
+    sys.exit(0)
+
 JSON = "--json" in sys.argv
 # Optional positional host filter: `labctl hosts opn-01`. A name is a FILTER, not a subcommand,
 # so the surface does not grow per device. Resolved against inventory once that is loaded.
@@ -152,15 +174,6 @@ with ThreadPoolExecutor(max_workers=min(8, len(items)) or 1) as _ex:
     for _res in _ex.map(_cred_for, items):
         if _res: cred_item[_res[0]] = _res[1]
 
-ROLE_BY_PREFIX = {"nas": "synology", "opn": "opnsense", "swt": "aruba-switch", "wap": "tplink-ap", "rpi": "raspberry-pi"}
-ROLE_PROFILE = {
-    "synology":     ("DSM API :5001 + SMB :445",        5001, "labctl nas"),
-    "aruba-switch": ("SSH operator :22 (show-only)",    22,   'labctl switch "<cmd>"'),
-    "opnsense":     ("REST API :443",                   443,  "labctl opnsense <path>"),
-    "tplink-ap":    ("web UI :80/443 (no RO handler)",  443,  "—"),
-    "raspberry-pi": ("SSH :22 (read-only claude)",      22,   'labctl rpi "<cmd>"'),
-}
-def role_of(name): return ROLE_BY_PREFIX.get(name.split("-")[0].lower())
 
 def alive(role, ip, iid):
     """Real read-only auth test. Returns (ok: bool, detail). Only called where a cred exists."""

@@ -19,14 +19,19 @@ read-only 1Password vault holding only lab hosts. Every path is a GET / show / r
 login: labctl can look, never touch. Device changes are done by hand, deliberately.
 
   labctl hosts                 inventory + reach/auth/drift — run this first
-  labctl hosts <name>          detail for one host (accepts opn-01, wblv-opn-01,
-                               or opn-01.wblv.uk — whichever form you have)
-  labctl opnsense <api/path>   GET an OPNsense read-only API endpoint
-                               (default: core/firmware/status)
-  labctl nas shares            list readable NAS shares
-  labctl nas ls <folder>       list a NAS folder
-  labctl switch "<show cmd>"   run an Aruba operator (show-only) command
+  labctl hosts <host>          detail for one host
+
+  labctl <host> [query]        query that host, dispatched by its role:
+                                 opn-01  <api/path>    OPNsense read-only REST API
+                                 nas-01  shares        readable NAS shares
+                                 nas-01  ls <folder>   list a NAS folder
+                                 swt-01  "<show cmd>"  Aruba operator (show-only)
+                                 rpi-01  "<cmd>"       read-only SSH
+
   labctl help                  this text
+
+Hosts accept any form you have: opn-01, WBLV-OPN-01, or opn-01.wblv.uk.
+A host is an ARGUMENT, not a command — adding a device adds a role handler, not a verb.
 
 Exit codes: 0 ok · 1 fault (creds, host, or device error) · 2 usage error
 USAGE
@@ -50,34 +55,40 @@ resolve_host(){
                       echo "        Add the host URL to that item. labctl will not guess an address." >&2; exit 1; }
 }
 
-cmd="${1:-help}"; shift || true
-case "$cmd" in
-hosts)
-  exec python3 "$HOME/.config/wblv/lab_discover.py" "$@"
-  ;;
-opnsense|opn)
-  id="$(item_id 'OPN')"; [ -n "$id" ] || { echo "no OPNsense creds in vault" >&2; exit 1; }
-  # Hostname, never an IP (standard #3). The old numeric-IP grep + hardcoded ADM fallback is
-  # obsolete: lab-9 repointed opn-01.wblv.uk to the ADM address on 2026-07-24, so the name now
-  # resolves to the interface mac-01 can actually reach. Addressing by name is also what lets TLS
-  # be verified for real — the LE wildcard is valid for the hostname and can never match a bare IP,
-  # which is the only reason this call previously needed -k.
-  resolve_host "$id" opnsense
-  K="$(field "$id" label=Key)"; K="${K#key=}"; S="$(field "$id" label=Secret)"; S="${S#secret=}"
+LD="$HOME/.config/wblv/lab_discover.py"
+
+# --- per-role query handlers -------------------------------------------------------------------
+# ONBOARDING A NEW HOST — four steps, no new top-level command, ever:
+#   1. add its hostname prefix + ROLE_PROFILE entry to the role model in lab_discover.py
+#   2. add a q_<role> handler below
+#   3. wire it into the role dispatch at the bottom
+#   4. create a `WBLV-<HOST> / CLAUDE` read-only item in 1Password with the host URL set
+# Inventory, reachability and the command surface all follow from those. That is the whole point
+# of dispatching on a hostname argument rather than adding a verb per device.
+#
+# $ITEM = the resolved 1Password item id, $HOSTQ = the short hostname as resolved. Both are set
+# by the dispatcher before a handler runs, so a handler can never target a different host than
+# the one that was asked for.
+
+q_opnsense(){
+  resolve_host "$ITEM" "$HOSTQ"
+  K="$(field "$ITEM" label=Key)"; K="${K#key=}"; S="$(field "$ITEM" label=Secret)"; S="${S#secret=}"
+  # TLS verified: the LE wildcard (lab-9) is valid for the hostname. See A1.
   curl -s -u "$K:$S" --max-time 15 "https://${HOST}/api/${1:-core/firmware/status}"
-  ;;
-nas)
-  id="$(item_id 'NAS')"; [ -n "$id" ] || { echo "no NAS creds in vault" >&2; exit 1; }
-  U="$(field "$id" label=username)"; P="$(field "$id" label=password)"; [ -n "$P" ] || P="$(field "$id" label=confirmpassword)"
-  # Host from the 1Password item URL (hostname, never an IP — standard #3). No fallback: see
-  # resolve_host. NB DSM keeps -k below because it still presents a self-signed cert
-  # (ssl_verify_result=20); drop the -k once lab-9's remainder redeploys the wildcard there.
-  resolve_host "$id" nas
+}
+
+q_synology(){
+  U="$(field "$ITEM" label=username)"; P="$(field "$ITEM" label=password)"
+  [ -n "$P" ] || P="$(field "$ITEM" label=confirmpassword)"
+  resolve_host "$ITEM" "$HOSTQ"
+  # DSM keeps -k: still a self-signed cert (ssl_verify_result=20) until lab-9's remainder
+  # redeploys the wildcard there. Verified, not assumed.
   B="https://${HOST}:5001/webapi"
   auth(){ curl -sk -G "$B/entry.cgi" --data-urlencode api=SYNO.API.Auth --data-urlencode version=7 "$@" --max-time 15; }
   SID="$(auth --data-urlencode method=login --data-urlencode account="$U" --data-urlencode passwd="$P" --data-urlencode session=FileStation --data-urlencode format=sid | jq -r '.data.sid//empty')"
-  [ -n "$SID" ] || { echo "NAS login failed" >&2; exit 1; }
+  [ -n "$SID" ] || { echo "labctl: $HOSTQ login failed (DSM rejected the read-only credential)" >&2; exit 1; }
   fs(){ curl -sk -G "$B/entry.cgi" --data-urlencode api=SYNO.FileStation.List --data-urlencode version=2 "$@" --data-urlencode _sid="$SID" --max-time 12; }
+  rc=0
   case "${1:-shares}" in
     shares) fs --data-urlencode method=list_share --data-urlencode additional=perm | jq -r '.data.shares[]?|"  "+.name+"  ("+.path+")  read="+((.additional.perm.acl.read)|tostring)+" write="+((.additional.perm.acl.write)|tostring)';;
     ls) fs --data-urlencode method=list --data-urlencode folder_path="${2:-/}" --data-urlencode 'additional=["size","time"]' \
@@ -88,24 +99,73 @@ nas)
                      | ((if .isdir then "-" else (.additional.size|hsz) end) | rpad(9)) as $sz
                      | ((.additional.time.mtime // 0) | if .==0 then "-" else (localtime|strftime("%Y-%m-%d %H:%M")) end) as $mt
                      | "  " + $n + $sz + $mt';;
-    *) echo "usage: labctl nas {shares|ls <folder>}" >&2;;
+    *) echo "labctl: unknown query '${1}' for $HOSTQ (synology). Try: shares | ls <folder>" >&2; rc=2;;
   esac
   auth --data-urlencode method=logout --data-urlencode session=FileStation --data-urlencode _sid="$SID" >/dev/null 2>&1
-  ;;
-switch|sw)
-  id="$(item_id 'SWT')"; [ -n "$id" ] || { echo "no switch creds in vault" >&2; exit 1; }
-  # SSH user comes from the item. No fallback to 'operator': the 2026-07-09 account model removed
-  # the anonymous operator login, so that fallback now yields an auth failure that looks like a
-  # switch problem instead of the missing-field problem it actually is.
-  U="$(field "$id" label=username)"
-  [ -n "$U" ] || { echo "labctl: 1Password switch item has no 'username' field." >&2; exit 1; }
-  export SWT_PW="$(field "$id" label=password)"; [ -n "$SWT_PW" ] || export SWT_PW="$(field "$id" 'label=Operator Password')"
-  resolve_host "$id" switch
+  return $rc
+}
+
+q_aruba_switch(){
+  U="$(field "$ITEM" label=username)"
+  [ -n "$U" ] || { echo "labctl: 1Password item for $HOSTQ has no 'username' field." >&2; exit 1; }
+  export SWT_PW="$(field "$ITEM" label=password)"
+  [ -n "$SWT_PW" ] || export SWT_PW="$(field "$ITEM" 'label=Operator Password')"
+  resolve_host "$ITEM" "$HOSTQ"
   "$HOME/.config/wblv/switch_show.py" "$HOST" "$U" "${@:-show system}"
+}
+
+q_raspberry_pi(){
+  U="$(field "$ITEM" label=username)"; U="${U#username=}"
+  P="$(field "$ITEM" label=password)"; [ -n "$P" ] || P="$(field "$ITEM" label=confirmpassword)"
+  P="${P#password=}"
+  [ -n "$U" ] && [ -n "$P" ] || { echo "labctl: 1Password item for $HOSTQ is missing username/password." >&2; exit 1; }
+  resolve_host "$ITEM" "$HOSTQ"
+  RPI_PW="$P" "$HOME/.config/wblv/rpi_show.py" "$HOST" "$U" "${@:-hostnamectl}"
+}
+
+# --- dispatch ----------------------------------------------------------------------------------
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+hosts)
+  exec python3 "$LD" "$@"
   ;;
-help|--help|-h) HELP;;
-# An unknown subcommand must NOT exit 0 with help text on stdout: through the MCP that returns
-# help as though it were lab data, with no error, and a typo'd command reads as a real answer.
-# Usage goes to stderr and the exit code is non-zero so callers can tell nothing was run.
-*) echo "labctl: unknown command '$cmd'" >&2; HELP >&2; exit 2;;
+help|--help|-h)
+  HELP
+  ;;
+*)
+  # Not a facet, so treat it as a hostname. Accepts opn-01 / WBLV-OPN-01 / opn-01.wblv.uk.
+  HOSTQ="$(printf '%s' "$cmd" | tr 'A-Z' 'a-z')"; HOSTQ="${HOSTQ%%.*}"; HOSTQ="${HOSTQ#wblv-}"
+  ROLE="$(python3 "$LD" --roles | jq -r --arg p "${HOSTQ%%-*}" '.prefix[$p] // empty')"
+  if [ -z "$ROLE" ]; then
+    echo "labctl: no handler for '$cmd'." >&2
+    echo "        It is not a command (hosts, help), and no device role is mapped to the" >&2
+    echo "        prefix '${HOSTQ%%-*}'. Some hosts legitimately have none — mac-01 is the" >&2
+    echo "        control node and dsk-01 is a workstation; neither exposes read-only mgmt." >&2
+    echo "        Run 'labctl hosts' to see every host and its role." >&2
+    exit 2
+  fi
+  # Resolve the vault item for THIS host by title (convention: WBLV-<HOST> [/ CLAUDE]). Matching
+  # on the requested host — rather than on a role keyword — is what stops `labctl opn-99 ...`
+  # silently querying opn-01 with opn-01's credentials.
+  ITEM="$(item_id "^WBLV-${HOSTQ}([ /]|\$)")"
+  if [ -z "$ITEM" ]; then
+    echo "labctl: no read-only 1Password item for host '$HOSTQ'." >&2
+    echo "        Expected an item titled 'WBLV-$(printf '%s' "$HOSTQ" | tr 'a-z' 'A-Z') / CLAUDE'." >&2
+    echo "        Run 'labctl hosts' to see which hosts have credentials." >&2
+    exit 1
+  fi
+  case "$ROLE" in
+    opnsense)     q_opnsense "$@" ;;
+    synology)     q_synology "$@" ;;
+    aruba-switch) q_aruba_switch "$@" ;;
+    raspberry-pi) q_raspberry_pi "$@" ;;
+    tplink-ap)
+      echo "labctl: $HOSTQ ($ROLE) has no read-only handler — the standalone AP exposes only a" >&2
+      echo "        web UI. Superseded by the Omada controller (lab-74)." >&2
+      exit 1 ;;
+    *)
+      echo "labctl: role '$ROLE' has no query handler yet. Add q_${ROLE//-/_}() in labctl." >&2
+      exit 1 ;;
+  esac
+  ;;
 esac

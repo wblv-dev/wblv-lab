@@ -139,40 +139,29 @@ def lab_hosts(host: str = "") -> str:
     An unknown name is an error listing the hosts that DO exist, never an empty result."""
     return _run(["hosts", "--json"] + ([host] if host else []))
 
-@mcp.tool(title="OPNsense read-only API",
-          annotations=ToolAnnotations(title="OPNsense read-only API", idempotentHint=True, **RO))
-def lab_opnsense(path: str = "core/firmware/status", limit: int = DEFAULT_ROWS, action: str = "") -> str:
-    """Read-only GET against the OPNsense firewall REST API (returns JSON). Useful paths:
-    'diagnostics/firewall/log' (live pass/block log — "what's breaking"),
-    'diagnostics/firewall/pf_states', 'diagnostics/interface/get_arp',
-    'diagnostics/system/system_resources', 'core/firmware/status'.
+@mcp.tool(title="Query a lab host",
+          annotations=ToolAnnotations(title="Query a lab host", **RO))
+def lab_host(host: str, query: str = "", limit: int = DEFAULT_ROWS, action: str = "") -> str:
+    """Run a read-only query against ONE lab host. The host is dispatched by its role, so this is
+    the single entry point for every device type — there is no per-device tool to remember.
 
-    Array responses are capped at `limit` rows (default 50, newest-first) and the reply always
-    states returned/matched/total, so you can see when you are looking at a subset. Set limit<=0
-    to lift the row cap. A hard 40,000-character ceiling applies either way — an oversized reply
-    is refused with a size and a hint rather than truncated into invalid JSON, and that refusal
-    is NOT an empty result.
+    host  — short name (opn-01), device hostname (wblv-opn-01) or FQDN. Get names from lab_hosts.
+    query — role-dependent:
+      opnsense      an API path, e.g. 'diagnostics/firewall/log', 'diagnostics/interface/get_arp',
+                    'diagnostics/system/system_resources', 'core/firmware/status' (default)
+      synology      'shares', or 'ls <folder>' e.g. 'ls /Media'
+      aruba-switch  an operator show command, e.g. 'show vlans', 'show interfaces brief'
+      raspberry-pi  a read-only shell command, e.g. 'hostname', 'systemctl is-active pihole-FTL'
 
-    Narrow before widening: action='block' (or 'pass') filters firewall-log rows, and a more
-    specific API path beats fetching everything. limit/action are ignored for non-array
-    responses, so they are safe on any path."""
-    return _slice_rows(_run(["opnsense", path]), limit, action)
+    Array responses are capped at `limit` rows (default 50) and always report
+    returned/matched/total; a 40,000-character ceiling applies regardless, refusing with a size
+    and a hint rather than truncating into invalid JSON. `action='block'|'pass'` filters
+    firewall-log rows. Both are ignored for non-array responses, so they are safe on any query.
 
-@mcp.tool(title="Synology NAS (read-only)",
-          annotations=ToolAnnotations(title="Synology NAS (read-only)", **RO))
-def lab_nas(action: str = "shares", folder: str = "/") -> str:
-    """Read-only Synology NAS (DS418play) query. action='shares' lists readable shares with
-    read/write flags; action='ls' lists the folder given by `folder` (e.g. '/Media')."""
-    args = ["nas", action] + ([folder] if action == "ls" else [])
-    return _run(args)
-
-@mcp.tool(title="Aruba switch show commands",
-          annotations=ToolAnnotations(title="Aruba switch show commands", idempotentHint=True, **RO))
-def lab_switch(command: str = "show system") -> str:
-    """Run a read-only Aruba 2930F operator 'show' command over SSH. Operator level = show-only
-    (no config). Examples: 'show version', 'show system', 'show vlans', 'show interfaces brief',
-    'show lldp info remote-device', 'show mac-address'."""
-    return _run(["switch", command])
+    An unknown host, a host with no credentials, or a role with no read-only handler is an ERROR
+    naming the cause — never an empty result."""
+    args = [host] + ([query] if query else [])
+    return _slice_rows(_run(args), limit, action)
 
 if __name__ == "__main__":
     mcp.run()
