@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --with pexpect --quiet --script
+#!/usr/bin/env -S uv run --with pexpect --with rich --quiet --script
 """wblv-lab — what is alive in the lab, and how to reach it.
 
 A directory, not a broker. It reports members, their state and their access route, then
@@ -383,34 +383,65 @@ and run commands yourself, so the read-only limit lives in the host account."""
 
 
 def render(rows, meta):
-    """Data only. No prose, no interpretation, no commentary.
+    """A table for humans. Colour encodes STATE and nothing else — green up, red down, dim
+    untested. Every glyph maps to a measured value; none of it is commentary.
 
-    REACH and AUTH are the results of two tests: it answered or it did not, the login worked
-    or it did not. Anything beyond that would be this tool explaining itself, and an
-    explanation is a thing that can be wrong while the measurement stays right."""
-    out = [f"wblv-lab   vault {meta['vault']}   ipam {meta['ipam_source']}   "
-           f"op-token {meta['token_age_days']}d", ""]
+    rich drops colour automatically when stdout is not a terminal, so a pipe or the session
+    hook gets clean text and only a human at a prompt sees the colour."""
+    from rich.console import Console
+    from rich.table import Table
+    from rich import box
+
+    # Off-TTY there is no width to detect and rich would assume 80, shrinking columns to
+    # ellipses. Honour COLUMNS if set, else give it room.
+    con = Console(width=None if sys.stdout.isatty() else int(os.environ.get("COLUMNS") or 200),
+                  highlight=False)
+    con.print(f"[dim]vault[/] {meta['vault']}   [dim]ipam[/] {meta['ipam_source']}   "
+              f"[dim]op-token[/] {meta['token_age_days']}d")
     if not rows:
-        return "\n".join(out + ["  no members match", ""])
+        con.print("[dim]no members match[/]")
+        return
 
-    w = lambda k, lo: max([lo] + [len(str(r.get(k) or "")) for r in rows])
-    cn, ci, cm, cx = w("name", 4), w("ip", 7), w("mac", 3), w("access", 6)
-    R = lambda v: "up" if v is True else ("down" if v is False else "-")
-    A = lambda v: "ok" if v is True else ("fail" if v is False else "-")
+    t = Table(box=box.SIMPLE_HEAD, header_style="bold", border_style="grey35",
+              pad_edge=False, show_edge=False, padding=(0, 1))
+    # Atomic values are no_wrap so they are never broken mid-token; the state columns carry a
+    # min_width floor. Narrowing therefore lands on ACCESS/CREDENTIAL, which have wrap points,
+    # instead of collapsing the columns that answer the actual question.
+    t.add_column("HOST", style="bold", no_wrap=True)
+    t.add_column("KIND", no_wrap=True)
+    t.add_column("ADDRESS", no_wrap=True)
+    t.add_column("MAC", style="grey50", no_wrap=True)
+    t.add_column("REACH", justify="center", no_wrap=True, min_width=5)
+    t.add_column("AUTH", justify="center", no_wrap=True, min_width=4)
+    t.add_column("ACCESS", style="cyan", no_wrap=True)   # the connectable URI: never mangle it
+    t.add_column("CREDENTIAL", style="grey50")           # wraps first if the terminal is narrow
+    t.add_column("USER", style="grey42", no_wrap=True)
 
-    out.append(f"  {'HOST':<{cn}}  {'KIND':<12} {'ADDRESS':<{ci}}  {'MAC':<{cm}}  "
-               f"{'REACH':<5} {'AUTH':<4}  {'ACCESS':<{cx}}  CREDENTIAL")
+    KIND = {"physical": "default", "virtual": "cyan", "service": "magenta",
+            "unclassified": "yellow"}
+    DASH = "[grey35]-[/]"
     for r in rows:
-        cred = r["item"] + (f"  {r['account']}" if r.get("account") else "")
-        out.append(f"  {r['name']:<{cn}}  {r['kind']:<12} {(r.get('ip') or '-'):<{ci}}  "
-                   f"{(r.get('mac') or '-'):<{cm}}  {R(r['reach']):<5} {A(r['auth']):<4}  "
-                   f"{(r.get('access') or '-'):<{cx}}  {cred}")
+        t.add_row(r["name"],
+                  f"[{KIND.get(r['kind'], 'yellow')}]{r['kind']}[/]",
+                  r.get("ip") or DASH,
+                  r.get("mac") or DASH,
+                  "[green]up[/]" if r["reach"] is True else
+                  "[red]down[/]" if r["reach"] is False else DASH,
+                  "[green]ok[/]" if r["auth"] is True else
+                  "[bold red]fail[/]" if r["auth"] is False else DASH,
+                  r.get("access") or DASH,
+                  r["item"],
+                  r.get("account") or DASH)
+    con.print(t)
 
-    hosts = [r for r in rows if r["kind"] != "service"]
-    out += ["", f"  hosts {len(hosts)}   services {len(rows) - len(hosts)}   "
-                f"reachable {sum(1 for r in rows if r['reach'] is True)}   "
-                f"authenticated {sum(1 for r in rows if r['auth'] is True)}", ""]
-    return "\n".join(out)
+    hosts = sum(1 for r in rows if r["kind"] != "service")
+    reachable = sum(1 for r in rows if r["reach"] is True)
+    authed = sum(1 for r in rows if r["auth"] is True)
+    tested = sum(1 for r in rows if r["auth"] is not None)
+    col = "green" if tested and authed == tested else "yellow" if authed else "red"
+    con.print(f"[dim]hosts[/] {hosts}   [dim]services[/] {len(rows) - hosts}   "
+              f"[dim]reachable[/] {reachable}/{len(rows)}   "
+              f"[dim]authenticated[/] [{col}]{authed}/{tested}[/]")
 
 
 if __name__ == "__main__":
@@ -431,4 +462,4 @@ if __name__ == "__main__":
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},
                          indent=2))
     else:
-        print(render(shown, meta))
+        render(shown, meta)
