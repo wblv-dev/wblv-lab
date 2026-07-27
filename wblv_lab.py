@@ -359,11 +359,95 @@ with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; 
     rows = list(ex.map(probe, _classified))
 rows.sort(key=lambda r: (r["kind"] == "service", r["name"]))
 
+HELP = """wblv-lab — what is alive in the lab, and how to reach it.
+
+  wblv-lab              every host and service
+  wblv-lab -p           physical hosts only
+  wblv-lab -v           virtual hosts only
+  wblv-lab -s           services only
+  wblv-lab --json       machine-readable
+  wblv-lab -h           this text
+
+Membership comes from 1Password: an item is what makes something a member, so adding one
+is the whole of onboarding. Detail comes from OPNsense, which is the IPAM. Nothing is
+cached — every run asks again, which costs a few seconds and buys accuracy.
+
+REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can answer on
+the network and still be useless to you.
+
+This tool tells you which credential opens a host. It does not turn the key — you connect
+and run commands yourself, so the read-only limit lives in the host account."""
+
+
+def render(rows, meta):
+    """Plain text, no colour: this output is injected into a context window as often as it is
+    read by a human, and ANSI escapes are noise in both places."""
+    out = [f"wblv-lab   vault {meta['vault']} · ipam {meta['ipam_source']} · "
+           f"op-token {meta['token_age_days']}d", ""]
+    if not rows:
+        return "\n".join(out + ["  (no members match that filter)", ""])
+
+    w = lambda k, lo: max([lo] + [len(str(r.get(k) or "")) for r in rows])
+    cn, ca, cx = w("name", 6), w("ip", 9), w("access", 8)
+    R = lambda v: "up" if v is True else ("down" if v is False else "—")
+    A = lambda v: "ok" if v is True else ("FAIL" if v is False else "—")
+
+    out.append(f"  {'HOST':<{cn}}  {'KIND':<9} {'ADDRESS':<{ca}}  {'REACH':<5} {'AUTH':<4}  "
+               f"{'ACCESS':<{cx}}  CREDENTIAL")
+    for r in rows:
+        cred = r["item"] + (f"  ({r['account']})" if r.get("account") else "")
+        out.append(f"  {r['name']:<{cn}}  {r['kind']:<9} {(r.get('ip') or '—'):<{ca}}  "
+                   f"{R(r['reach']):<5} {A(r['auth']):<4}  {(r.get('access') or '—'):<{cx}}  {cred}")
+
+    # Anything needing a human decision goes below the table, not inside it — a row stays
+    # scannable, and a problem is never a column you have to notice.
+    # A malformed URL is the CAUSE of "no endpoint", so it replaces that note rather than
+    # sitting beside it. Two lines describing one fault reads as two faults.
+    notes = [(r["name"], "1Password URL field is malformed — no usable endpoint"
+              if r.get("endpoint_malformed") else r["auth_detail"])
+             for r in rows if r["auth"] is not True and (r.get("auth_detail") or r.get("endpoint_malformed"))]
+    notes += [(r["name"], r["kind_drift"]) for r in rows if r.get("kind_drift")]
+    notes += [(r["name"], r["auth_detail"]) for r in rows
+              if r["auth"] is True and "operator" not in (r["auth_detail"] or "")
+              and "EXPECTED" in (r["auth_detail"] or "")]
+    if notes:
+        out += ["", "  notes"]
+        nw = max(len(n) for n, _ in notes)
+        out += [f"    {n:<{nw}}  {d}" for n, d in notes]
+
+    hosts = [r for r in rows if r["kind"] != "service"]
+    ok = sum(1 for r in hosts if r["auth"] is True)
+    kinds = ", ".join(f"{sum(1 for r in hosts if r['kind'] == k)} {k}"
+                      for k in ("physical", "virtual", "unclassified")
+                      if any(r["kind"] == k for r in hosts))
+    svc = len(rows) - len(hosts)
+    parts = []
+    if hosts:
+        parts.append(f"{len(hosts)} host{'s' if len(hosts) != 1 else ''}"
+                     + (f" ({kinds})" if kinds else "")
+                     + f" · {ok} of {len(hosts)} authenticated")
+    if svc:
+        parts.append(f"{svc} service{'s' if svc != 1 else ''}")
+    out += ["", "  " + " · ".join(parts), ""]
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
-    # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
-    KEEP = ("name", "kind", "source", "kind_drift", "fqdn", "ip", "mac", "vendor", "role",
-            "access", "reach", "auth", "auth_detail", "item", "account", "endpoint",
-            "endpoint_malformed")
-    print(json.dumps({"vault": VAULT, "token_age_days": TOKEN_AGE_DAYS,
-                      "ipam_source": opn["endpoint"],
-                      "members": [{k: r.get(k) for k in KEEP} for r in rows]}, indent=2))
+    if {"-h", "--help", "help"} & set(sys.argv[1:]):
+        print(HELP); sys.exit(0)
+
+    want = ({"physical"} if "-p" in sys.argv else set()) | \
+           ({"virtual"} if "-v" in sys.argv else set()) | \
+           ({"service"} if "-s" in sys.argv else set())
+    shown = [r for r in rows if not want or r["kind"] in want]
+
+    meta = {"vault": VAULT, "token_age_days": TOKEN_AGE_DAYS, "ipam_source": opn["endpoint"]}
+    if "--json" in sys.argv:
+        # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
+        KEEP = ("name", "kind", "source", "kind_drift", "fqdn", "ip", "mac", "vendor", "role",
+                "access", "reach", "auth", "auth_detail", "item", "account", "endpoint",
+                "endpoint_malformed")
+        print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},
+                         indent=2))
+    else:
+        print(render(shown, meta))
