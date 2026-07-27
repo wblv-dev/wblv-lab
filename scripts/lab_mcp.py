@@ -4,17 +4,38 @@ Thin stdio server over the `labctl` CLI (single backend). Headless: creds come f
 1Password service-account token file via labctl/op; no desktop app, no prompts.
 """
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 import subprocess, json
 
 mcp = FastMCP("wblv-lab")
 LABCTL = "/opt/homebrew/bin/labctl"
 
 def _run(args, timeout=45):
+    """Run labctl and return its stdout. RAISES on any failure — never returns an error string.
+
+    A failure must be distinguishable from data at the PROTOCOL level, not by the caller noticing
+    a word in the text. Returning "ERROR: ... timed out" made a dead probe indistinguishable from
+    a successful result that happens to mention an error, so the model would reason over a failure
+    as though it were a fact — the exact thing this tool exists to prevent.
+
+    FastMCP converts a raised exception into a CallToolResult with isError=true, so the client can
+    tell the difference without parsing prose.
+    """
+    cmd = "labctl " + " ".join(args)
     try:
         r = subprocess.run([LABCTL, *args], capture_output=True, text=True, timeout=timeout)
-        return (r.stdout or "") + (("\n[stderr] " + r.stderr) if r.returncode and r.stderr else "")
+    except FileNotFoundError:
+        raise ToolError(
+            f"labctl not found at {LABCTL}. The lab tooling is not installed or not on PATH on "
+            f"this host, so NO lab state can be read. Do not answer from memory or from notes.")
     except subprocess.TimeoutExpired:
-        return f"ERROR: `labctl {' '.join(args)}` timed out after {timeout}s"
+        raise ToolError(
+            f"`{cmd}` timed out after {timeout}s. The lab may be unreachable. Lab state is "
+            f"UNKNOWN for this call — do not substitute a remembered or previously-seen value.")
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip()
+        raise ToolError(f"`{cmd}` failed (exit {r.returncode}): {detail[:800] or 'no output'}")
+    return r.stdout or ""
 
 def _slice_rows(out, limit, action):
     """For JSON-array API responses, optionally filter by an 'action' field and cap to the

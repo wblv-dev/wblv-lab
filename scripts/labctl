@@ -86,5 +86,9 @@ switch|sw)
   resolve_host "$id" switch
   "$HOME/.config/wblv/switch_show.py" "$HOST" "$U" "${@:-show system}"
   ;;
-help|--help|-h|*) HELP;;
+help|--help|-h) HELP;;
+# An unknown subcommand must NOT exit 0 with help text on stdout: through the MCP that returns
+# help as though it were lab data, with no error, and a typo'd command reads as a real answer.
+# Usage goes to stderr and the exit code is non-zero so callers can tell nothing was run.
+*) echo "labctl: unknown command '$cmd'" >&2; HELP >&2; exit 2;;
 esac
