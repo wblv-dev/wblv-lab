@@ -18,6 +18,21 @@ item_id(){ op item list --vault "$V" --format json 2>/dev/null | jq -r --arg re 
 field(){ op item get "$1" --vault "$V" --fields "$2" --reveal 2>/dev/null; }
 item_url(){ op item get "$1" --vault "$V" --format json 2>/dev/null | jq -r '(.urls//[]|map(.href)|join(","))'; }
 
+# Resolve a host from its 1Password item URL into $HOST. NEVER substitutes a guess.
+#
+# A fallback host is a silent wrong answer, and this tool exists precisely so that it cannot be
+# wrong. If an item has no URL that is a data fault in 1Password, and it must be visible rather
+# than papered over: an error names the fault, a fallback sends you debugging the wrong host.
+# (This replaced a fallback to 10.19.0.177 — the switch's LAN address, dead since 2026-07-08 —
+# which would have "worked" right up until it silently didn't.)
+#
+# Called directly, never inside $(...): `exit` in a command substitution only kills the subshell.
+resolve_host(){
+  HOST="$(item_url "$1" | sed -E 's#https?://##;s#[/,].*##;s#:.*##' | head -1)"
+  [ -n "$HOST" ] || { echo "labctl: 1Password item for '$2' has no URL — cannot resolve a hostname." >&2
+                      echo "        Add the host URL to that item. labctl will not guess an address." >&2; exit 1; }
+}
+
 cmd="${1:-help}"; shift || true
 case "$cmd" in
 hosts)
@@ -30,17 +45,18 @@ opnsense|opn)
   # resolves to the interface mac-01 can actually reach. Addressing by name is also what lets TLS
   # be verified for real — the LE wildcard is valid for the hostname and can never match a bare IP,
   # which is the only reason this call previously needed -k.
-  h="$(item_url "$id" | sed -E 's#https?://##;s#[/,].*##;s#:.*##' | head -1)"; h="${h:-opn-01.wblv.uk}"
+  resolve_host "$id" opnsense
   K="$(field "$id" label=Key)"; K="${K#key=}"; S="$(field "$id" label=Secret)"; S="${S#secret=}"
-  curl -s -u "$K:$S" --max-time 15 "https://${h}/api/${1:-core/firmware/status}"
+  curl -s -u "$K:$S" --max-time 15 "https://${HOST}/api/${1:-core/firmware/status}"
   ;;
 nas)
   id="$(item_id 'NAS')"; [ -n "$id" ] || { echo "no NAS creds in vault" >&2; exit 1; }
   U="$(field "$id" label=username)"; P="$(field "$id" label=password)"; [ -n "$P" ] || P="$(field "$id" label=confirmpassword)"
-  # Resolve the NAS host from its 1Password item URL (hostname, not a hardcoded IP — standard #3).
-  # nas-01.wblv.uk resolves to the ADM address via the lab DNS; fall back to the FQDN if the URL is bare.
-  h="$(item_url "$id" | sed -E 's#https?://##;s#[/,].*##;s#:.*##' | head -1)"; h="${h:-nas-01.wblv.uk}"
-  B="https://${h}:5001/webapi"
+  # Host from the 1Password item URL (hostname, never an IP — standard #3). No fallback: see
+  # resolve_host. NB DSM keeps -k below because it still presents a self-signed cert
+  # (ssl_verify_result=20); drop the -k once lab-9's remainder redeploys the wildcard there.
+  resolve_host "$id" nas
+  B="https://${HOST}:5001/webapi"
   auth(){ curl -sk -G "$B/entry.cgi" --data-urlencode api=SYNO.API.Auth --data-urlencode version=7 "$@" --max-time 15; }
   SID="$(auth --data-urlencode method=login --data-urlencode account="$U" --data-urlencode passwd="$P" --data-urlencode session=FileStation --data-urlencode format=sid | jq -r '.data.sid//empty')"
   [ -n "$SID" ] || { echo "NAS login failed" >&2; exit 1; }
@@ -61,10 +77,14 @@ nas)
   ;;
 switch|sw)
   id="$(item_id 'SWT')"; [ -n "$id" ] || { echo "no switch creds in vault" >&2; exit 1; }
-  U="$(field "$id" label=username)"; [ -n "$U" ] || U=operator   # SSH user = item username (e.g. 'claude'); legacy fallback 'operator'
+  # SSH user comes from the item. No fallback to 'operator': the 2026-07-09 account model removed
+  # the anonymous operator login, so that fallback now yields an auth failure that looks like a
+  # switch problem instead of the missing-field problem it actually is.
+  U="$(field "$id" label=username)"
+  [ -n "$U" ] || { echo "labctl: 1Password switch item has no 'username' field." >&2; exit 1; }
   export SWT_PW="$(field "$id" label=password)"; [ -n "$SWT_PW" ] || export SWT_PW="$(field "$id" 'label=Operator Password')"
-  h="$(item_url "$id" | sed -E 's#https?://##;s#[/,].*##' | head -1)"; h="${h:-10.19.0.177}"
-  "$HOME/.config/wblv/switch_show.py" "$h" "$U" "${@:-show system}"
+  resolve_host "$id" switch
+  "$HOME/.config/wblv/switch_show.py" "$HOST" "$U" "${@:-show system}"
   ;;
 help|--help|-h|*) HELP;;
 esac
