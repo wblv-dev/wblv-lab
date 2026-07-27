@@ -25,15 +25,21 @@ if prompt.endswith("#"):
 pchar = prompt[-1] if prompt else ">"
 
 def run(cmd):
-    c.sendline(cmd); buf = ""
+    c.sendline(cmd)
+    # Consume the echoed command line first, so the prompt that PRECEDES it (from the echo)
+    # isn't matched as end-of-output — that race left some commands (show ip ssh / snmp-server /
+    # time) captured empty. After this, the next prompt is the real end of output.
+    try: c.expect_exact(cmd, timeout=10)
+    except Exception: pass
+    buf = ""
     while True:
-        j = c.expect([r"-- MORE --[^\n]*", re.escape(prompt), rf"[A-Za-z0-9._\-]+{re.escape(pchar)}",
-                      pexpect.TIMEOUT], timeout=25)
+        j = c.expect([r"-- MORE --[^\n]*", re.escape(prompt), pexpect.TIMEOUT], timeout=25)
         buf += c.before or ""
         if j == 0:
             c.send(" "); continue
         break
-    buf = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", buf)      # strip ANSI
+    buf = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", buf)      # strip complete ANSI CSI sequences
+    buf = re.sub(r"\x1b\[[0-9;?]*", "", buf)              # strip residual/cut CSI (e.g. a truncated ESC[200;)
     buf = re.sub(r"\x1b[=>]", "", buf).replace("\r", "")
     return "\n".join(l for l in buf.splitlines() if l.strip() and not l.strip().startswith(cmd)).strip()
 

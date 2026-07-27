@@ -10,14 +10,63 @@ Data model (2026-07): OPNsense is the authoritative IPAM/inventory source.
  alive   <- a REAL read-only auth/query per host (L7), only where a cred exists
 Read-only. Uses nc/curl/ssh (NOT python sockets — macOS Local Network Privacy blocks those).
 """
-import os, sys, subprocess, json, re
+import os, sys, subprocess, json, re, time
+from concurrent.futures import ThreadPoolExecutor
 
 JSON = "--json" in sys.argv
-TOKEN = open(os.path.expanduser("~/.config/wblv/op-token")).read().strip()
-ENV = {**os.environ, "OP_SERVICE_ACCOUNT_TOKEN": TOKEN}
+TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 HELPER = os.path.expanduser("~/.config/wblv/switch_show.py")
+RPI_HELPER = os.path.expanduser("~/.config/wblv/rpi_show.py")
 
-def op(*a): return subprocess.run(["op", *a], capture_output=True, text=True, env=ENV).stdout
+def die(msg, **extra):
+    """Single, clean fail-fast (lab-20b). In JSON mode emit ONE error object so the MCP shows one
+    root cause (not a Python traceback); in text mode a one-line stderr note. Never a stack trace."""
+    print(json.dumps({"error": msg, **extra}, indent=2) if JSON else f"labctl hosts: {msg}",
+          file=(sys.stdout if JSON else sys.stderr))
+    sys.exit(1)
+
+def _token_age_days():
+    try: return round((time.time() - os.path.getmtime(TOKEN_PATH)) / 86400, 1)
+    except OSError: return None
+
+# --- 1Password substrate pre-check (lab-20b) --------------------------------------------------
+# Prove the token + 1P are usable ONCE, up front. A token/1P fault otherwise surfaces as N
+# cascading per-host "auth failed" rows that hide the real, single root cause — fail fast here
+# instead. Also surfaces op-token age (file mtime = install/rotation date; a service account
+# can't read its own expiry via the CLI) for the lab-61 expiry monitor.
+try:
+    TOKEN = open(TOKEN_PATH).read().strip()
+except OSError as e:
+    die(f"op-token unreadable at {TOKEN_PATH} ({e.__class__.__name__})")
+if not TOKEN:
+    die(f"op-token empty at {TOKEN_PATH}")
+ENV = {**os.environ, "OP_SERVICE_ACCOUNT_TOKEN": TOKEN}
+
+def op(*a, timeout=12):
+    """Run `op`; return '' on any failure/timeout so callers degrade gracefully (never hang)."""
+    try:
+        return subprocess.run(["op", *a], capture_output=True, text=True, env=ENV, timeout=timeout).stdout
+    except subprocess.TimeoutExpired:
+        return ""
+
+# `op whoami` = the cheapest proof the token is valid AND 1P is reachable. Name the actual cause
+# from stderr so the single message we print points at the real fault (bad token vs. no network).
+try:
+    _who = subprocess.run(["op", "whoami", "--format", "json"], capture_output=True, text=True, env=ENV, timeout=15)
+    _rc, _err = _who.returncode, (_who.stderr or "")
+except subprocess.TimeoutExpired:
+    _rc, _err = 1, "timed out contacting 1Password (network)"
+if _rc != 0:
+    e = _err.lower()
+    cause = ("1Password unreachable (network)" if any(k in e for k in
+                ("network", "timeout", "timed out", "connection", "dial", "lookup", "no such host", "temporarily"))
+             else "op-token invalid or expired" if any(k in e for k in
+                ("unauthor", "invalid", "401", "403", "expired", "authenticate", "token"))
+             else "op whoami failed")
+    die(f"1P substrate check failed: {cause}", detail=_err.strip()[:200], token_age_days=_token_age_days())
+
+TOKEN_AGE_DAYS = _token_age_days()
+
 def field(iid, label): return op("item", "get", iid, "--vault", VAULT, "--fields", f"label={label}", "--reveal").strip()
 def full(iid): return json.loads(op("item", "get", iid, "--vault", VAULT, "--format", "json") or "{}")
 def hostof(f):
@@ -34,7 +83,11 @@ def curl(url, *extra, t=8):
 _vaults = json.loads(op("vault", "list", "--format", "json") or "[]") or []
 VAULT = next((v["name"] for v in _vaults if "claude" in v.get("name", "").lower()),
              (_vaults or [{}])[0].get("name", ""))
+if not VAULT:
+    die("service account sees no vault (token valid but mis-scoped?)", token_age_days=TOKEN_AGE_DAYS)
 items = json.loads(op("item", "list", "--vault", VAULT, "--format", "json") or "[]")
+if not items:
+    die(f"vault '{VAULT}' returned no items (1P read hiccup or empty vault?)", token_age_days=TOKEN_AGE_DAYS)
 
 # --- bootstrap OPNsense API creds from its vault item (needed to read inventory + ARP) ---
 OPN = {}
@@ -45,7 +98,9 @@ if opn:
     oip = ""  # resolved from inventory below; fall back to the well-known gateway
     OPN = {"k": K, "s": S}
 
-OGW = "10.19.0.1"  # OPNsense API endpoint (gateway); inventory/ARP are read from here
+OGW = "10.19.10.1"  # OPNsense API on the ADM interface. mac-01 lives on ADM, so it talks to the
+# router's ADM IP directly (intra-zone). The LAN IP 10.19.0.1 only worked while ADM->LAN was wide
+# open; the tight ADM->LAN policy (pinholes only) now blocks it. inventory/ARP are read from here.
 vendor, arp_mac, inventory = {}, {}, {}
 if OPN:
     try:
@@ -66,17 +121,32 @@ if OPN:
     except Exception: pass
 
 # --- creds index: short hostname -> vault item id (attach read-only creds by hostname) ---
+# Only PLAIN device-login items map here. Qualified/service accounts (title contains "/", e.g.
+# "WBLV-NAS-01 / AUTO", a write-capable backup account) are skipped so a read/write service
+# credential can never be picked up as the read-only device liveness/auth probe cred.
 cred_item = {}
-for it in items:
-    fq = hostof(full(it["id"]))
-    if fq: cred_item[fq.split(".")[0].lower()] = it["id"]
+def _cred_for(it):
+    # Index only the read-only device-login creds. Convention: 'WBLV-<HOST>' or
+    # 'WBLV-<HOST> / CLAUDE' are the read-only probe logins; write/service accounts
+    # (e.g. '/ AUTO') are excluded so a writer can never be used as the probe cred.
+    norm = it.get("title", "").upper().replace(" ", "")
+    if "/" in norm and not norm.endswith("/CLAUDE"):
+        return None
+    fq = hostof(full(it["id"]))                           # one `op item get` per item — the slow part
+    return (fq.split(".")[0].lower(), it["id"]) if fq else None
+# Parallelised (lab-20d): the per-item `op` fetches are independent and network-bound. ex.map
+# preserves input order, so same-host collisions still resolve last-wins as the serial loop did.
+with ThreadPoolExecutor(max_workers=min(8, len(items)) or 1) as _ex:
+    for _res in _ex.map(_cred_for, items):
+        if _res: cred_item[_res[0]] = _res[1]
 
-ROLE_BY_PREFIX = {"nas": "synology", "opn": "opnsense", "swt": "aruba-switch", "wap": "tplink-ap"}
+ROLE_BY_PREFIX = {"nas": "synology", "opn": "opnsense", "swt": "aruba-switch", "wap": "tplink-ap", "rpi": "raspberry-pi"}
 ROLE_PROFILE = {
     "synology":     ("DSM API :5001 + SMB :445",        5001, "labctl nas"),
     "aruba-switch": ("SSH operator :22 (show-only)",    22,   'labctl switch "<cmd>"'),
     "opnsense":     ("REST API :443",                   443,  "labctl opnsense <path>"),
     "tplink-ap":    ("web UI :80/443 (no RO handler)",  443,  "—"),
+    "raspberry-pi": ("SSH :22 (read-only claude)",      22,   'labctl rpi "<cmd>"'),
 }
 def role_of(name): return ROLE_BY_PREFIX.get(name.split("-")[0].lower())
 
@@ -89,11 +159,20 @@ def alive(role, ip, iid):
             return (bool(v), f"OPNsense {v}" if v else "auth failed")
         if role == "synology":
             U = field(iid, "username"); P = field(iid, "password") or field(iid, "confirmpassword")
-            r = subprocess.run(["curl", "-sk", "--max-time", "10", "-G", f"https://{ip}:5001/webapi/entry.cgi",
-                                "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
-                                "--data-urlencode", "method=login", "--data-urlencode", f"account={U}",
-                                "--data-urlencode", f"passwd={P}", "--data-urlencode", "session=FileStation",
-                                "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
+            if not (U and P):
+                # 1Password read hiccup during a heavy run — not an auth failure (lab-22)
+                return (None, "cred fetch failed (1P)")
+            def _login():
+                return subprocess.run(["curl", "-sk", "--max-time", "12", "-G", f"https://{ip}:5001/webapi/entry.cgi",
+                                       "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
+                                       "--data-urlencode", "method=login", "--data-urlencode", f"account={U}",
+                                       "--data-urlencode", f"passwd={P}", "--data-urlencode", "session=FileStation",
+                                       "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
+            r = _login()
+            if not r.strip():
+                # empty = curl timed out on a briefly-busy DSM; retry once. Only on a timeout,
+                # never on a real auth-error code, so a misconfig can't escalate DSM auto-block (lab-22)
+                time.sleep(3); r = _login()
             j = json.loads(r or "{}")
             sid = j.get("data", {}).get("sid")
             if sid:
@@ -105,12 +184,25 @@ def alive(role, ip, iid):
                 return (True, "DSM login ok")
             return (False, f"login err {j.get('error',{}).get('code')}")
         if role == "aruba-switch":
+            un = field(iid, "username") or "operator"   # SSH user = item username (e.g. 'claude'); legacy fallback
             pw = field(iid, "password") or field(iid, "Operator Password")
             # Execute the helper directly so its `uv run --with pexpect` shebang applies.
-            r = subprocess.run([HELPER, ip, "operator", "show system"],
+            r = subprocess.run([HELPER, ip, un, "show system"],
                                env={**os.environ, "SWT_PW": pw}, capture_output=True, text=True, timeout=30)
             ok = "System Name" in r.stdout
-            return (ok, "operator login ok" if ok else "ssh/login failed")
+            return (ok, "login ok" if ok else "ssh/login failed")
+        if role == "raspberry-pi":
+            U = field(iid, "username"); P = field(iid, "password") or field(iid, "confirmpassword")
+            U = U[9:] if U.startswith("username=") else U
+            P = P[9:] if P.startswith("password=") else P
+            if not (U and P):
+                return (None, "cred fetch failed (1P)")   # 1P hiccup, not auth failure (lab-22)
+            # read-only SSH as the no-sudo 'claude' user; the localhost DNS query doubles as an
+            # auth proof AND a Pi-hole resolver-health proof (must resolve + forward wblv.uk)
+            r = subprocess.run([RPI_HELPER, ip, U, "dig +short @127.0.0.1 nas-01.wblv.uk"],
+                               env={**os.environ, "RPI_PW": P}, capture_output=True, text=True, timeout=30)
+            ok = "10.19.10.10" in r.stdout
+            return (ok, "ssh + pihole resolve ok" if ok else "ssh/login or resolve failed")
     except Exception as e:
         return (False, f"err {type(e).__name__}")
     return (None, "no handler")
@@ -123,33 +215,46 @@ def drift_of(ip, mac):
         return f"IP conflict: {ip} live on {live} not {mac}"
     return "ok"
 
-rows = []
-for name in sorted(inventory):
+def probe(name):
+    """Reach + auth probe for one inventory host. Independent per host → safe to run concurrently."""
     inv = inventory[name]
     ip, mac, descr, fqdn = inv["ip"], inv["mac"], inv["descr"], inv["fqdn"]
     role = role_of(name)
     access, port, verb = ROLE_PROFILE.get(role, ("host / no mgmt tool", None, "—"))
     iid = cred_item.get(name)                             # read-only cred, if one exists
-    port_open = nc_open(ip, port) if (port and ip) else False
-    reach = port_open or (ping_ok(ip) if ip else False)   # REACH: heartbeat (mgmt port OR ICMP)
+    # mac-01 is on ADM; it reaches the router on its ADM IP (10.19.10.1), not the LAN IP the
+    # inventory lists for opn-01 — that path is closed by the tight ADM->LAN policy. Probe the
+    # address mac-01 can actually reach so the router isn't falsely reported down.
+    probe_ip = OGW if role == "opnsense" else ip
+    port_open = nc_open(probe_ip, port) if (port and probe_ip) else False
+    reach = port_open or (ping_ok(probe_ip) if probe_ip else False)   # REACH: heartbeat (mgmt port OR ICMP)
     if iid and port_open and role in ROLE_PROFILE and role != "tplink-ap":
-        auth = alive(role, ip, iid)[0]                    # AUTH: did a read-only login/query succeed?
+        auth = alive(role, probe_ip, iid)[0]              # AUTH: did a read-only login/query succeed?
     else:
         auth = None                                       # no creds / no read-only interface → n/a
-    rows.append({"host": name, "fqdn": fqdn, "ip": ip or None, "mac": mac or None,
-                 "role": role or "?", "has_creds": bool(iid), "reach": reach, "auth": auth,
-                 "use": verb, "drift": drift_of(ip, mac)})
+    return {"host": name, "fqdn": fqdn, "ip": ip or None, "mac": mac or None,
+            "role": role or "?", "has_creds": bool(iid), "reach": reach, "auth": auth,
+            "use": verb, "drift": drift_of(ip, mac)}
+
+# Parallelised (lab-20d): per-host probes are independent and I/O-bound (nc/ping/curl/ssh), so
+# wall-clock drops from sum-of-hosts (~39s serial) to the slowest single host. ex.map preserves
+# order so the table stays name-sorted; the lone DSM login stays single (no concurrent NAS auth).
+_names = sorted(inventory)
+with ThreadPoolExecutor(max_workers=min(8, len(_names)) or 1) as _ex:
+    rows = list(_ex.map(probe, _names))
 
 issues = [f"{r['host']}: {r['drift']}" for r in rows if r["drift"] != "ok"]
 drift_summary = {"checked": len(rows), "ok": sum(1 for r in rows if r["drift"] == "ok"), "issues": issues}
 
 if JSON:
     print(json.dumps({"vault": VAULT, "source": "OPNsense Dnsmasq host entries",
+                      "substrate": {"ok": True, "op_token_age_days": TOKEN_AGE_DAYS},
                       "ipam_drift": drift_summary, "hosts": rows}, indent=2))
 else:
     R = lambda b: "up" if b else "down"
     A = lambda v: "ok" if v is True else ("fail" if v is False else "—")
     print(f"inventory: OPNsense host entries   creds: {VAULT} (read-only, by hostname)")
+    print(f"1P substrate: OK   op-token age: {TOKEN_AGE_DAYS}d (mtime → lab-61)")
     print("REACH = mgmt-port/ICMP heartbeat   AUTH = read-only login (ok / fail / — = no creds)")
     hdr = f"{'HOST':<10}{'IP':<15}{'MAC':<20}{'REACH':<7}{'AUTH'}"
     print(hdr); print("-" * len(hdr))
