@@ -59,6 +59,36 @@ def die(msg, **extra):
     sys.exit(1)
 
 
+HELP = """wblv-lab — what is alive in the lab, and how to reach it.
+
+  wblv-lab              every host and service
+  wblv-lab -p           physical hosts only
+  wblv-lab -v           virtual hosts only
+  wblv-lab -s           services only
+  wblv-lab --json       machine-readable
+  wblv-lab -h           this text
+
+Membership comes from 1Password: an item is what makes something a member, so adding one
+is the whole of onboarding. Detail comes from OPNsense, which is the IPAM. Nothing is
+cached — every run asks again, which costs a few seconds and buys accuracy.
+
+REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can answer on
+the network and still be useless to you.
+
+This tool tells you which credential opens a host. It does not turn the key — you connect
+and run commands yourself, so the read-only limit lives in the host account."""
+
+# Both are read before any work is done. Printing help used to cost a full probe run, and a
+# filtered view used to probe every host and then throw most of the results away — the flags
+# were parsed in __main__, which runs last.
+if {"-h", "--help", "help"} & set(sys.argv[1:]):
+    print(HELP); sys.exit(0)
+
+WANT = ({"physical"} if "-p" in sys.argv else set()) | \
+       ({"virtual"} if "-v" in sys.argv else set()) | \
+       ({"service"} if "-s" in sys.argv else set())
+
+
 # --- 1Password substrate ------------------------------------------------------------------
 # Prove the token and 1P are usable ONCE, up front. Otherwise a single substrate fault shows
 # up as N cascading per-host failures that bury the actual cause.
@@ -154,16 +184,21 @@ if not opn:
     die("no OPNsense member in the vault — cannot read the lab's IPAM",
         hint="an item whose URL host starts 'opn-' supplies the inventory")
 
-_full = json.loads(op("item", "get", opn["item"], "--vault", VAULT, "--format", "json") or "{}")
-_f = {(x.get("label") or "").lower(): (x.get("value") or "") for x in (_full.get("fields") or [])}
+# Every item's fields were already read when membership was resolved. Fetching this one
+# again cost a second `op item get` — about a second — for bytes we were already holding.
+_f = CREDS.get(opn["name"], {})
 K, S = _f.get("key", "").removeprefix("key="), _f.get("secret", "").removeprefix("secret=")
 if not (K and S):
     die(f"the OPNsense item '{opn['item']}' has no Key/Secret fields")
 
 API = f"https://{opn['endpoint']}/api"
 inventory, arp = {}, {}
+# Independent endpoints, so they are read at the same time rather than one after the other.
+with ThreadPoolExecutor(max_workers=2) as ex:
+    _dns = ex.submit(curl, f"{API}/dnsmasq/settings/get", "-u", f"{K}:{S}")
+    _arp = ex.submit(curl, f"{API}/diagnostics/interface/get_arp", "-u", f"{K}:{S}")
 try:
-    dj = json.loads(curl(f"{API}/dnsmasq/settings/get", "-u", f"{K}:{S}") or "{}")
+    dj = json.loads(_dns.result() or "{}")
     for h in (dj.get("dnsmasq", {}).get("hosts", {}) or {}).values():
         nm = h.get("host", "")
         if nm:
@@ -176,7 +211,7 @@ except Exception:
         hint="OPNsense is the inventory authority; without it there is no lab directory")
 
 try:
-    for e in json.loads(curl(f"{API}/diagnostics/interface/get_arp", "-u", f"{K}:{S}") or "[]"):
+    for e in json.loads(_arp.result() or "[]"):
         if e.get("ip"):
             arp[e["ip"]] = e.get("manufacturer", "")
 except Exception:
@@ -344,6 +379,19 @@ def auth_probe(r):
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
 
+def reach_probe(host, port):
+    """The two tests are raced, not tried in turn. Either one answering is proof of life, so
+    waiting for the first to time out before starting the second simply adds one timeout to
+    the other — and that only ever happens on a host that is down, which is precisely the host
+    that sets the wall-clock for the whole run.
+
+    The timeouts themselves are deliberately NOT reduced. They are what stops a slow-but-alive
+    host being reported as down, and a false 'down' is the failure this tool exists to avoid."""
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futures = ([ex.submit(nc_open, host, port)] if port else []) + [ex.submit(ping_ok, host)]
+        return any(f.result() for f in futures)
+
+
 def probe(r):
     """REACH is a heartbeat; AUTH is proof. Kept apart because health checks lie: a host can
     answer on the network and still be useless to you, and some hosts drop ICMP entirely."""
@@ -351,35 +399,17 @@ def probe(r):
     port = ROLES.get(r["name"][:3], (None, None, None))[2]
     if not host:
         return {**r, "reach": None, "auth": None, "auth_detail": ""}
-    reach = (nc_open(host, port) if port else False) or ping_ok(host)
+    reach = reach_probe(host, port)
     ok, detail = auth_probe(r) if reach else (None, "")
     return {**r, "reach": reach, "auth": ok, "auth_detail": detail}
 
 
-_classified = [classify(m) for m in members]
+# Filtering here rather than at print time: a filtered view has no reason to probe hosts it
+# will not show, and `-s` was paying for five host probes to print one service row.
+_classified = [c for c in (classify(m) for m in members) if not WANT or c["kind"] in WANT]
 with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; NAS stays single
     rows = list(ex.map(probe, _classified))
 rows.sort(key=lambda r: (r["kind"] == "service", r["name"]))
-
-HELP = """wblv-lab — what is alive in the lab, and how to reach it.
-
-  wblv-lab              every host and service
-  wblv-lab -p           physical hosts only
-  wblv-lab -v           virtual hosts only
-  wblv-lab -s           services only
-  wblv-lab --json       machine-readable
-  wblv-lab -h           this text
-
-Membership comes from 1Password: an item is what makes something a member, so adding one
-is the whole of onboarding. Detail comes from OPNsense, which is the IPAM. Nothing is
-cached — every run asks again, which costs a few seconds and buys accuracy.
-
-REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can answer on
-the network and still be useless to you.
-
-This tool tells you which credential opens a host. It does not turn the key — you connect
-and run commands yourself, so the read-only limit lives in the host account."""
-
 
 def render(rows, meta):
     """A table for humans. Colour encodes STATE and nothing else — green up, red down, dim
@@ -473,13 +503,7 @@ def render(rows, meta):
 
 
 if __name__ == "__main__":
-    if {"-h", "--help", "help"} & set(sys.argv[1:]):
-        print(HELP); sys.exit(0)
-
-    want = ({"physical"} if "-p" in sys.argv else set()) | \
-           ({"virtual"} if "-v" in sys.argv else set()) | \
-           ({"service"} if "-s" in sys.argv else set())
-    shown = [r for r in rows if not want or r["kind"] in want]
+    shown = rows                       # WANT was applied before the probes, not after them
 
     meta = {"vault": VAULT, "token_age_days": TOKEN_AGE_DAYS, "ipam_source": opn["endpoint"]}
     if "--json" in sys.argv:
