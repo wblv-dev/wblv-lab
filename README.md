@@ -4,11 +4,6 @@
 
 `wblv-lab` tells you what is alive in the lab and how to reach it. That is all it does.
 
-It is **not** a broker. It does not run your queries, wrap device APIs, or invent
-vocabulary for things the device already names. It answers one question — *what exists,
-is it up, and how do I get in* — then gets out of the way. You connect to the host
-yourself, using the credential it points you at, and run commands there directly.
-
 ```
 wblv-lab            every host and service
 wblv-lab -p         physical hosts
