@@ -54,27 +54,75 @@ def _run(args, timeout=45):
         raise ToolError(f"`{cmd}` failed (exit {r.returncode}): {detail[:800] or 'no output'}")
     return r.stdout or ""
 
-def _slice_rows(out, limit, action):
-    """For JSON-array API responses, optionally filter by an 'action' field and cap to the
-    newest `limit` rows (OPNsense returns the firewall log newest-first). Wraps the result so
-    truncation is explicit. Non-array / non-JSON output is returned unchanged, so this stays
-    safe for every other OPNsense path."""
-    if not (limit or action):
+# Context-safety ceilings. These are DEFAULTS, not opt-ins — a guard you have to remember to
+# switch on is not a guard. `diagnostics/firewall/log` returns ~830,000 characters (~200k tokens):
+# one unguarded call ends the session, with no error, because an oversized success is still a
+# success. The row cap handles arrays; the char ceiling is the backstop for everything else,
+# since a non-array endpoint can be just as large.
+MAX_CHARS = 40_000     # hard ceiling on any single response, applied last, always
+DEFAULT_ROWS = 50      # default row cap for JSON arrays; limit<=0 lifts it (ceiling still applies)
+
+def _cap(out):
+    """Final backstop. Applied to every response after row-limiting.
+
+    Truncating JSON mid-structure would emit something that looks parseable and isn't, so an
+    oversized JSON payload is replaced by a structured notice instead of a mangled fragment.
+    Plain text is safe to cut, and is cut with a visible marker."""
+    if len(out) <= MAX_CHARS:
         return out
+    stripped = out.lstrip()
+    if stripped.startswith(("{", "[")):
+        return json.dumps({
+            "error": "response too large to return",
+            "chars": len(out), "ceiling": MAX_CHARS,
+            "hint": "Narrow the query: pass limit=N for array endpoints, action='block'/'pass' "
+                    "for the firewall log, or request a more specific API path. Nothing was "
+                    "returned — this is NOT an empty result.",
+        }, indent=2)
+    return out[:MAX_CHARS] + (f"\n\n[TRUNCATED: {len(out):,} chars exceeded the "
+                              f"{MAX_CHARS:,}-char ceiling. Narrow the query.]")
+
+def _slice_rows(out, limit, action):
+    """For JSON-array API responses: optionally filter by an 'action' field, then cap to the
+    newest `limit` rows (OPNsense returns the firewall log newest-first). The wrapper always
+    reports returned/matched/total, so truncation is never silent. Non-array and non-JSON output
+    passes through to the char ceiling unchanged."""
     try:
         data = json.loads(out)
     except (ValueError, TypeError):
-        return out
+        return _cap(out)
     if not isinstance(data, list):
-        return out
+        return _cap(out)
     total = len(data)
     if action:
         data = [r for r in data if isinstance(r, dict) and r.get("action") == action]
     matched = len(data)
-    if limit and limit > 0:
+    if limit > 0:
         data = data[:limit]
-    return json.dumps({"returned": len(data), "matched": matched, "total": total,
-                       "note": "newest-first; filtered/truncated by lab_opnsense", "rows": data})
+
+    # Shrink to fit rather than refuse. Row size varies hugely by endpoint — a firewall-log row
+    # is ~900 chars, an ARP row ~60 — so no constant row cap is right for every path. Returning
+    # the largest prefix that fits, and saying so, beats returning nothing: the caller asked for
+    # rows, and "here are 40 of 1000" is useful where "too large" is not.
+    n = len(data)
+    while n > 0:
+        payload = json.dumps({
+            "returned": n, "matched": matched, "total": total,
+            "note": ("newest-first. " +
+                     (f"Showing {n} of {matched} matching rows"
+                      if n < matched else f"Showing all {n} matching rows") +
+                     (f" (of {total} before the action filter)." if action else ".") +
+                     (" Reduced to fit the response ceiling — narrow with action= or a more "
+                      "specific path to see different rows." if n < min(limit or matched, matched)
+                      else "")),
+            "rows": data[:n]}, indent=1)
+        if len(payload) <= MAX_CHARS:
+            return payload
+        n = n - 1 if n <= 5 else int(n * 0.75)
+    return json.dumps({
+        "error": "even a single row exceeds the response ceiling",
+        "matched": matched, "total": total, "ceiling": MAX_CHARS,
+        "hint": "Request a more specific API path. This is NOT an empty result."}, indent=1)
 
 @mcp.tool(title="Lab inventory + liveness",
           annotations=ToolAnnotations(title="Lab inventory + liveness", **RO))
@@ -88,15 +136,21 @@ def lab_hosts() -> str:
 
 @mcp.tool(title="OPNsense read-only API",
           annotations=ToolAnnotations(title="OPNsense read-only API", idempotentHint=True, **RO))
-def lab_opnsense(path: str = "core/firmware/status", limit: int = 0, action: str = "") -> str:
+def lab_opnsense(path: str = "core/firmware/status", limit: int = DEFAULT_ROWS, action: str = "") -> str:
     """Read-only GET against the OPNsense firewall REST API (returns JSON). Useful paths:
     'diagnostics/firewall/log' (live pass/block log — "what's breaking"),
     'diagnostics/firewall/pf_states', 'diagnostics/interface/get_arp',
     'diagnostics/system/system_resources', 'core/firmware/status'.
-    Large array endpoints (esp. diagnostics/firewall/log — ~1000 rows / ~1MB) blow the token
-    cap: pass limit=N to return only the newest N rows (the log is newest-first). Optionally
-    pass action='block' (or 'pass') to keep only firewall-log rows with that action. limit and
-    action are ignored for non-array responses, so they're safe on any path."""
+
+    Array responses are capped at `limit` rows (default 50, newest-first) and the reply always
+    states returned/matched/total, so you can see when you are looking at a subset. Set limit<=0
+    to lift the row cap. A hard 40,000-character ceiling applies either way — an oversized reply
+    is refused with a size and a hint rather than truncated into invalid JSON, and that refusal
+    is NOT an empty result.
+
+    Narrow before widening: action='block' (or 'pass') filters firewall-log rows, and a more
+    specific API path beats fetching everything. limit/action are ignored for non-array
+    responses, so they are safe on any path."""
     return _slice_rows(_run(["opnsense", path]), limit, action)
 
 @mcp.tool(title="Synology NAS (read-only)",
