@@ -28,13 +28,13 @@ TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 #
 # ONBOARDING A NEW DEVICE TYPE: add a prefix and an access description. Onboarding a new HOST
 # of an existing type needs nothing here at all — just the 1Password item.
-ROLES = {                     # prefix -> (role, how you get in, port to knock on)
-    "opn": ("opnsense",     "REST API :443",                443),
-    "nas": ("synology",     "DSM API :5001",               5001),
-    "swt": ("aruba-switch", "SSH operator :22 (show-only)",  22),
-    "rpi": ("linux",        "SSH :22 (read-only account)",   22),
-    "wap": ("tplink-ap",    "web UI :443 (no RO mechanism)",443),
-    "pve": ("proxmox",      "REST API :8006",              8006),
+ROLES = {                     # prefix -> (role, protocol, port)
+    "opn": ("opnsense",     "https",  443),
+    "nas": ("synology",     "https", 5001),
+    "swt": ("aruba-switch", "ssh",     22),
+    "rpi": ("linux",        "ssh",     22),
+    "wap": ("tplink-ap",    "https",  443),
+    "pve": ("proxmox",      "https", 8006),
 }
 
 # Credentials are held OUT of the member records so they cannot reach stdout. Output rows are
@@ -199,7 +199,7 @@ def classify(m):
     rather than quietly resolved — same idea as the IPAM reserved-vs-live drift check. Neither
     signal is discarded, because each catches what the other cannot."""
     inv = inventory.get(m["name"], {})
-    role, access, _port = ROLES.get(m["name"][:3], ("unknown", "unknown", None))
+    role, proto, port = ROLES.get(m["name"][:3], ("", "", None))
     vendor = arp.get(inv.get("ip", ""), "")
 
     declared = next((t.lower() for t in m["tags"] if t.lower() in TAG_KINDS), "")
@@ -214,7 +214,10 @@ def classify(m):
 
     drift = (f"tagged {declared}, but the wire says {observed}"
              if declared and observed and declared != observed else "")
-    return {**m, **inv, "role": role, "access": access, "vendor": vendor,
+    return {**m, **inv, "role": role, "port": port,
+            "access": (f"{proto}://{inv.get('fqdn') or m['endpoint']}:{port}"
+                       if port and (inv.get('fqdn') or m['endpoint']) else ""),
+            "vendor": vendor,
             "kind": declared or observed or "unclassified",
             "source": "tag" if declared else ("wire" if observed else "none"),
             "kind_drift": drift}
@@ -338,7 +341,7 @@ def auth_probe(r):
             if r["role"] == "aruba-switch":
                 return aruba_probe(u, host, pw)
             return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok")
-        return None, f"no read-only mechanism for role '{r['role']}'"
+        return None, ""
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
 
@@ -348,9 +351,9 @@ def probe(r):
     host = r.get("fqdn") or r["endpoint"]
     port = ROLES.get(r["name"][:3], (None, None, None))[2]
     if not host:
-        return {**r, "reach": None, "auth": None, "auth_detail": "no endpoint"}
+        return {**r, "reach": None, "auth": None, "auth_detail": ""}
     reach = (nc_open(host, port) if port else False) or ping_ok(host)
-    ok, detail = auth_probe(r) if reach else (None, "not attempted — unreachable")
+    ok, detail = auth_probe(r) if reach else (None, "")
     return {**r, "reach": reach, "auth": ok, "auth_detail": detail}
 
 
@@ -380,55 +383,33 @@ and run commands yourself, so the read-only limit lives in the host account."""
 
 
 def render(rows, meta):
-    """Plain text, no colour: this output is injected into a context window as often as it is
-    read by a human, and ANSI escapes are noise in both places."""
-    out = [f"wblv-lab   vault {meta['vault']} · ipam {meta['ipam_source']} · "
+    """Data only. No prose, no interpretation, no commentary.
+
+    REACH and AUTH are the results of two tests: it answered or it did not, the login worked
+    or it did not. Anything beyond that would be this tool explaining itself, and an
+    explanation is a thing that can be wrong while the measurement stays right."""
+    out = [f"wblv-lab   vault {meta['vault']}   ipam {meta['ipam_source']}   "
            f"op-token {meta['token_age_days']}d", ""]
     if not rows:
-        return "\n".join(out + ["  (no members match that filter)", ""])
+        return "\n".join(out + ["  no members match", ""])
 
     w = lambda k, lo: max([lo] + [len(str(r.get(k) or "")) for r in rows])
-    cn, ca, cx = w("name", 6), w("ip", 9), w("access", 8)
-    R = lambda v: "up" if v is True else ("down" if v is False else "—")
-    A = lambda v: "ok" if v is True else ("FAIL" if v is False else "—")
+    cn, ci, cm, cx = w("name", 4), w("ip", 7), w("mac", 3), w("access", 6)
+    R = lambda v: "up" if v is True else ("down" if v is False else "-")
+    A = lambda v: "ok" if v is True else ("fail" if v is False else "-")
 
-    out.append(f"  {'HOST':<{cn}}  {'KIND':<9} {'ADDRESS':<{ca}}  {'REACH':<5} {'AUTH':<4}  "
-               f"{'ACCESS':<{cx}}  CREDENTIAL")
+    out.append(f"  {'HOST':<{cn}}  {'KIND':<12} {'ADDRESS':<{ci}}  {'MAC':<{cm}}  "
+               f"{'REACH':<5} {'AUTH':<4}  {'ACCESS':<{cx}}  CREDENTIAL")
     for r in rows:
-        cred = r["item"] + (f"  ({r['account']})" if r.get("account") else "")
-        out.append(f"  {r['name']:<{cn}}  {r['kind']:<9} {(r.get('ip') or '—'):<{ca}}  "
-                   f"{R(r['reach']):<5} {A(r['auth']):<4}  {(r.get('access') or '—'):<{cx}}  {cred}")
-
-    # Anything needing a human decision goes below the table, not inside it — a row stays
-    # scannable, and a problem is never a column you have to notice.
-    # A malformed URL is the CAUSE of "no endpoint", so it replaces that note rather than
-    # sitting beside it. Two lines describing one fault reads as two faults.
-    notes = [(r["name"], "1Password URL field is malformed — no usable endpoint"
-              if r.get("endpoint_malformed") else r["auth_detail"])
-             for r in rows if r["auth"] is not True and (r.get("auth_detail") or r.get("endpoint_malformed"))]
-    notes += [(r["name"], r["kind_drift"]) for r in rows if r.get("kind_drift")]
-    notes += [(r["name"], r["auth_detail"]) for r in rows
-              if r["auth"] is True and "operator" not in (r["auth_detail"] or "")
-              and "EXPECTED" in (r["auth_detail"] or "")]
-    if notes:
-        out += ["", "  notes"]
-        nw = max(len(n) for n, _ in notes)
-        out += [f"    {n:<{nw}}  {d}" for n, d in notes]
+        cred = r["item"] + (f"  {r['account']}" if r.get("account") else "")
+        out.append(f"  {r['name']:<{cn}}  {r['kind']:<12} {(r.get('ip') or '-'):<{ci}}  "
+                   f"{(r.get('mac') or '-'):<{cm}}  {R(r['reach']):<5} {A(r['auth']):<4}  "
+                   f"{(r.get('access') or '-'):<{cx}}  {cred}")
 
     hosts = [r for r in rows if r["kind"] != "service"]
-    ok = sum(1 for r in hosts if r["auth"] is True)
-    kinds = ", ".join(f"{sum(1 for r in hosts if r['kind'] == k)} {k}"
-                      for k in ("physical", "virtual", "unclassified")
-                      if any(r["kind"] == k for r in hosts))
-    svc = len(rows) - len(hosts)
-    parts = []
-    if hosts:
-        parts.append(f"{len(hosts)} host{'s' if len(hosts) != 1 else ''}"
-                     + (f" ({kinds})" if kinds else "")
-                     + f" · {ok} of {len(hosts)} authenticated")
-    if svc:
-        parts.append(f"{svc} service{'s' if svc != 1 else ''}")
-    out += ["", "  " + " · ".join(parts), ""]
+    out += ["", f"  hosts {len(hosts)}   services {len(rows) - len(hosts)}   "
+                f"reachable {sum(1 for r in rows if r['reach'] is True)}   "
+                f"authenticated {sum(1 for r in rows if r['auth'] is True)}", ""]
     return "\n".join(out)
 
 
