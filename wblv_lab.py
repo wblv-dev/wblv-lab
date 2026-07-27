@@ -123,7 +123,6 @@ def _member(item):
                  if (f.get("label") or "").lower() == "username"), "")
     name = endpoint.split(".")[0].lower() if endpoint else \
            title.split("/")[0].strip().lower().removeprefix("wblv-")
-    name = name  # noqa: keep explicit for readability
     CREDS[name] = {(f.get("label") or "").lower(): (f.get("value") or "")
                    for f in (full.get("fields") or [])}
     return {"item": title, "endpoint": endpoint, "account": user, "name": name,
@@ -386,36 +385,62 @@ def render(rows, meta):
     """A table for humans. Colour encodes STATE and nothing else — green up, red down, dim
     untested. Every glyph maps to a measured value; none of it is commentary.
 
+    The counts go ABOVE the table because they are the answer to "is the lab healthy"; the
+    table is the detail you read only when a count is wrong.
+
     rich drops colour automatically when stdout is not a terminal, so a pipe or the session
     hook gets clean text and only a human at a prompt sees the colour."""
     from rich.console import Console
     from rich.table import Table
+    from rich.measure import Measurement
     from rich import box
 
     # Off-TTY there is no width to detect and rich would assume 80, shrinking columns to
     # ellipses. Honour COLUMNS if set, else give it room.
     con = Console(width=None if sys.stdout.isatty() else int(os.environ.get("COLUMNS") or 200),
                   highlight=False)
-    con.print(f"[dim]vault[/] {meta['vault']}   [dim]ipam[/] {meta['ipam_source']}   "
-              f"[dim]op-token[/] {meta['token_age_days']}d")
+
+    def field(label, value, style=""):
+        v = f"[{style}]{value}[/]" if style else str(value)
+        con.print(f"[dim]{label + ':':<15}[/]{v}")
+
+    field("Vault", meta["vault"])
+    field("Source", meta["ipam_source"])
+    field("Token age", f"{meta['token_age_days']}d")
+    con.print()
+
     if not rows:
         con.print("[dim]no members match[/]")
         return
 
-    t = Table(box=box.SIMPLE_HEAD, header_style="bold", border_style="grey35",
-              pad_edge=False, show_edge=False, padding=(0, 1))
+    hosts = sum(1 for r in rows if r["kind"] != "service")
+    reachable = sum(1 for r in rows if r["reach"] is True)
+    authed = sum(1 for r in rows if r["auth"] is True)
+    tested = sum(1 for r in rows if r["auth"] is not None)
+    field("Hosts", hosts)
+    field("Services", len(rows) - hosts)
+    field("Reachable", f"{reachable}/{len(rows)}",
+          "green" if reachable == len(rows) else "yellow")
+    field("Authenticated", f"{authed}/{tested}",
+          "green" if tested and authed == tested else "yellow" if authed else "red")
+    con.print()
+
+    # SIMPLE without an edge is the only box that starts at column 0 — every bordered style
+    # reserves a blank edge column and indents the whole block by one. It gives the rule under
+    # the header; the rules above and below are drawn here, at the table's measured width.
+    t = Table(box=box.SIMPLE, show_edge=False, header_style="bold", border_style="grey35",
+              pad_edge=False, padding=(0, 1))
     # Atomic values are no_wrap so they are never broken mid-token; the state columns carry a
-    # min_width floor. Narrowing therefore lands on ACCESS/CREDENTIAL, which have wrap points,
-    # instead of collapsing the columns that answer the actual question.
+    # min_width floor. Narrowing therefore lands on CREDENTIAL, which has wrap points, instead
+    # of collapsing the columns that answer the actual question.
     t.add_column("HOST", style="bold", no_wrap=True)
     t.add_column("KIND", no_wrap=True)
     t.add_column("ADDRESS", no_wrap=True)
     t.add_column("MAC", style="grey50", no_wrap=True)
     t.add_column("REACH", justify="center", no_wrap=True, min_width=5)
     t.add_column("AUTH", justify="center", no_wrap=True, min_width=4)
-    t.add_column("ACCESS", style="cyan", no_wrap=True)   # the connectable URI: never mangle it
-    t.add_column("CREDENTIAL", style="grey50")           # wraps first if the terminal is narrow
-    t.add_column("USER", style="grey42", no_wrap=True)
+    t.add_column("ACCESS", style="cyan", no_wrap=True)   # connectable URI: never mangle it
+    t.add_column("CREDENTIAL", style="grey50")
 
     KIND = {"physical": "default", "virtual": "cyan", "service": "magenta",
             "unclassified": "yellow"}
@@ -430,18 +455,21 @@ def render(rows, meta):
                   "[green]ok[/]" if r["auth"] is True else
                   "[bold red]fail[/]" if r["auth"] is False else DASH,
                   r.get("access") or DASH,
-                  r["item"],
-                  r.get("account") or DASH)
-    con.print(t)
+                  r["item"])
 
-    hosts = sum(1 for r in rows if r["kind"] != "service")
-    reachable = sum(1 for r in rows if r["reach"] is True)
-    authed = sum(1 for r in rows if r["auth"] is True)
-    tested = sum(1 for r in rows if r["auth"] is not None)
-    col = "green" if tested and authed == tested else "yellow" if authed else "red"
-    con.print(f"[dim]hosts[/] {hosts}   [dim]services[/] {len(rows) - hosts}   "
-              f"[dim]reachable[/] {reachable}/{len(rows)}   "
-              f"[dim]authenticated[/] [{col}]{authed}/{tested}[/]")
+    # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
+    # column down to a single character — a stack of ellipses that looks like output while
+    # carrying nothing. min_width does not hold at that point. For a directory tool a mangled
+    # value is worse than an ugly one, so the table is rendered at its NATURAL width and a
+    # narrow terminal is left to soft-wrap: every value survives, legibly, at the cost of
+    # looking untidy below about 120 columns.
+    probe = Console(width=10_000, no_color=True)
+    natural = Measurement.get(probe, probe.options, t).maximum
+    out = con if natural <= con.width else Console(width=natural, highlight=False)
+    rule = "[grey35]" + "─" * natural + "[/]"
+    out.print(rule)
+    out.print(t)
+    out.print(rule)
 
 
 if __name__ == "__main__":
