@@ -24,14 +24,20 @@ TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 #
 # ONBOARDING A NEW DEVICE TYPE: add a prefix and an access description. Onboarding a new HOST
 # of an existing type needs nothing here at all — just the 1Password item.
-ROLES = {
-    "opn": ("opnsense",     "REST API :443"),
-    "nas": ("synology",     "DSM API :5001"),
-    "swt": ("aruba-switch", "SSH operator :22 (show-only)"),
-    "rpi": ("linux",        "SSH :22"),
-    "wap": ("tplink-ap",    "web UI :443"),
-    "pve": ("proxmox",      "REST API :8006"),
+ROLES = {                     # prefix -> (role, how you get in, port to knock on)
+    "opn": ("opnsense",     "REST API :443",                443),
+    "nas": ("synology",     "DSM API :5001",               5001),
+    "swt": ("aruba-switch", "SSH operator :22 (show-only)",  22),
+    "rpi": ("linux",        "SSH :22 (read-only account)",   22),
+    "wap": ("tplink-ap",    "web UI :443 (no RO mechanism)",443),
+    "pve": ("proxmox",      "REST API :8006",              8006),
 }
+
+SSH_KEY = os.path.expanduser("~/.ssh/id_ed25519")
+
+# Credentials are held OUT of the member records so they cannot reach stdout. Output rows are
+# built from an explicit whitelist below; a secret must never be one accidental print away.
+CREDS = {}
 
 # Vendor strings OPNsense resolves from the OUI. Matched on the NAME the router reports, not
 # on a local OUI table — the lookup is the device's, we only classify the answer.
@@ -115,8 +121,11 @@ def _member(item):
                  if (f.get("label") or "").lower() == "username"), "")
     name = endpoint.split(".")[0].lower() if endpoint else \
            title.split("/")[0].strip().lower().removeprefix("wblv-")
+    name = name  # noqa: keep explicit for readability
+    CREDS[name] = {(f.get("label") or "").lower(): (f.get("value") or "")
+                   for f in (full.get("fields") or [])}
     return {"item": title, "endpoint": endpoint, "account": user, "name": name,
-            "endpoint_malformed": junk}
+            "endpoint_malformed": junk, "tags": full.get("tags") or []}
 
 
 items = json.loads(op("item", "list", "--vault", VAULT, "--format", "json") or "[]")
@@ -174,28 +183,120 @@ except Exception:
 
 
 # --- classify -------------------------------------------------------------------------------
+TAG_KINDS = ("physical", "virtual", "service")
+
 def classify(m):
-    """A member with an IPAM entry is a HOST; one without is a SERVICE (M365, a SaaS tenant).
-    Derived from whether the lab's own DNS knows it — nothing is labelled by hand."""
+    """Two independent answers to the same question, kept apart on purpose.
+
+    DECLARED — a 1Password tag: Harry stating what a thing is. Authoritative, and the only
+    signal that works for members with no MAC at all, or whose ARP entry has aged out.
+    OBSERVED — what the wire says: an IPAM entry means it is a machine, and the vendor string
+    OPNsense resolves from the OUI says whether that machine is virtual.
+
+    The declaration wins. The observation corroborates it, and a disagreement is reported
+    rather than quietly resolved — same idea as the IPAM reserved-vs-live drift check. Neither
+    signal is discarded, because each catches what the other cannot."""
     inv = inventory.get(m["name"], {})
-    role, access = ROLES.get(m["name"][:3], ("unknown", "unknown"))
+    role, access, _port = ROLES.get(m["name"][:3], ("unknown", "unknown", None))
     vendor = arp.get(inv.get("ip", ""), "")
+
+    declared = next((t.lower() for t in m["tags"] if t.lower() in TAG_KINDS), "")
     if not inv:
-        kind = "service"                       # no IPAM entry: a SaaS tenant, not a machine
+        observed = "service"                  # no IPAM entry: a SaaS tenant, not a machine
     elif any(h in vendor.lower() for h in HYPERVISORS):
-        kind = "virtual"
+        observed = "virtual"
     elif vendor:
-        kind = "physical"
+        observed = "physical"
     else:
-        # In the IPAM but absent from ARP — a quiet or unreachable host ages out, taking its
-        # vendor string with it. Say "unclassified", never assume physical: the honest answer
-        # is that we could not tell, and it will resolve itself the moment the host responds.
-        kind = "unclassified"
-    return {**m, **inv, "role": role, "access": access, "vendor": vendor, "kind": kind}
+        observed = ""                         # aged out of ARP — the wire cannot tell us
+
+    drift = (f"tagged {declared}, but the wire says {observed}"
+             if declared and observed and declared != observed else "")
+    return {**m, **inv, "role": role, "access": access, "vendor": vendor,
+            "kind": declared or observed or "unclassified",
+            "source": "tag" if declared else ("wire" if observed else "none"),
+            "kind_drift": drift}
 
 
-rows = sorted((classify(m) for m in members), key=lambda r: (r["kind"] == "service", r["name"]))
+# --- REACH and AUTH: measured, never recorded ----------------------------------------------
+def nc_open(host, port, t=3):
+    return subprocess.run(["nc", "-z", "-G", str(t), "-w", str(t), host, str(port)],
+                          capture_output=True).returncode == 0
+
+def ping_ok(host, t=2):
+    return subprocess.run(["ping", "-c", "1", "-t", str(t), host], capture_output=True).returncode == 0
+
+def ssh_probe(user, host):
+    """Key-only. BatchMode never prompts, so a missing key fails fast instead of hanging, and
+    PreferredAuthentications=publickey stops SSH silently falling back to a password — which
+    would make 'the key works' indistinguishable from 'the password worked'."""
+    r = subprocess.run(["ssh", "-i", SSH_KEY, "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+                        "-o", "StrictHostKeyChecking=accept-new",
+                        "-o", "PreferredAuthentications=publickey",
+                        f"{user}@{host}", "echo wblv-ok"],
+                       capture_output=True, text=True, timeout=20)
+    if r.returncode == 0 and "wblv-ok" in r.stdout:
+        return True, "key accepted"
+    err = (r.stderr or "").strip().splitlines()[-1:] or [""]
+    if "publickey" in err[0] or "Permission denied" in err[0]:
+        return False, "key not deployed for this account"
+    return False, err[0][:70] or "ssh failed"
+
+def auth_probe(r):
+    """A REAL read-only login, using the host's own mechanism. Returns (ok|None, detail).
+    None means 'cannot be tested', which is different from 'failed' and must stay different."""
+    c, host = CREDS.get(r["name"], {}), r.get("fqdn") or r["endpoint"]
+    if not host:
+        return None, "no endpoint to test"
+    try:
+        if r["role"] == "opnsense":
+            k = c.get("key", "").removeprefix("key="); sec = c.get("secret", "").removeprefix("secret=")
+            j = json.loads(curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}") or "{}")
+            v = j.get("product_version")
+            return (bool(v), f"OPNsense {v}" if v else "API rejected the credential")
+        if r["role"] == "synology":
+            u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
+            base = f"https://{host}:5001/webapi/entry.cgi"
+            out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
+                "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
+                "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
+                "--data-urlencode", f"passwd={pw}", "--data-urlencode", "session=FileStation",
+                "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
+            sid = (json.loads(out or "{}").get("data") or {}).get("sid")
+            if sid:   # release it: repeated DSM logins churn sessions and can trip auto-block
+                subprocess.run(["curl", "-sk", "--max-time", "8", "-G", base,
+                    "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
+                    "--data-urlencode", "method=logout", "--data-urlencode", "session=FileStation",
+                    "--data-urlencode", f"_sid={sid}"], capture_output=True)
+            return (bool(sid), "DSM login ok" if sid else "DSM rejected the credential")
+        if r["role"] in ("aruba-switch", "linux"):
+            return ssh_probe(r.get("account") or "claude", host)
+        return None, f"no read-only mechanism for role '{r['role']}'"
+    except Exception as e:
+        return None, f"probe error: {type(e).__name__}"
+
+def probe(r):
+    """REACH is a heartbeat; AUTH is proof. Kept apart because health checks lie: a host can
+    answer on the network and still be useless to you, and some hosts drop ICMP entirely."""
+    host = r.get("fqdn") or r["endpoint"]
+    port = ROLES.get(r["name"][:3], (None, None, None))[2]
+    if not host:
+        return {**r, "reach": None, "auth": None, "auth_detail": "no endpoint"}
+    reach = (nc_open(host, port) if port else False) or ping_ok(host)
+    ok, detail = auth_probe(r) if reach else (None, "not attempted — unreachable")
+    return {**r, "reach": reach, "auth": ok, "auth_detail": detail}
+
+
+_classified = [classify(m) for m in members]
+with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; NAS stays single
+    rows = list(ex.map(probe, _classified))
+rows.sort(key=lambda r: (r["kind"] == "service", r["name"]))
 
 if __name__ == "__main__":
+    # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
+    KEEP = ("name", "kind", "source", "kind_drift", "fqdn", "ip", "mac", "vendor", "role",
+            "access", "reach", "auth", "auth_detail", "item", "account", "endpoint",
+            "endpoint_malformed")
     print(json.dumps({"vault": VAULT, "token_age_days": TOKEN_AGE_DAYS,
-                      "ipam_source": opn["endpoint"], "members": rows}, indent=2))
+                      "ipam_source": opn["endpoint"],
+                      "members": [{k: r.get(k) for k in KEEP} for r in rows]}, indent=2))
