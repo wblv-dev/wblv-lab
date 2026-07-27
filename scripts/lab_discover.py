@@ -76,8 +76,13 @@ def nc_open(ip, p, t=2):
     return subprocess.run(["nc", "-z", "-G", str(t), "-w", str(t), ip, str(p)], capture_output=True).returncode == 0
 def ping_ok(ip, t=2):  # macOS: -t is timeout-in-seconds. L3 liveness for hosts with no reachable mgmt port.
     return subprocess.run(["ping", "-c", "1", "-t", str(t), ip], capture_output=True).returncode == 0
-def curl(url, *extra, t=8):
-    return subprocess.run(["curl", "-sk", "--max-time", str(t), *extra, url], capture_output=True, text=True).stdout
+def curl(url, *extra, t=8, verify=False):
+    """HTTP GET. `verify=True` enforces TLS validation and REQUIRES the url to address the host
+    by hostname — a certificate can never match a bare IP, so verification and IP-addressing are
+    mutually exclusive. Verification is on for OPNsense (valid LE wildcard, lab-9) and off for
+    hosts still presenting self-signed certs (DSM, until the lab-9 remainder redeploys there)."""
+    flags = ["-s"] if verify else ["-sk"]
+    return subprocess.run(["curl", *flags, "--max-time", str(t), *extra, url], capture_output=True, text=True).stdout
 
 # prefer the Claude-scoped vault by name (robust if the token ever sees >1 vault), else first
 _vaults = json.loads(op("vault", "list", "--format", "json") or "[]") or []
@@ -95,22 +100,25 @@ opn = next((i for i in items if "OPN" in i["title"].upper()), None)
 if opn:
     K = field(opn["id"], "Key");    K = K[4:] if K.startswith("key=") else K
     S = field(opn["id"], "Secret"); S = S[7:] if S.startswith("secret=") else S
-    oip = ""  # resolved from inventory below; fall back to the well-known gateway
     OPN = {"k": K, "s": S}
 
-OGW = "10.19.10.1"  # OPNsense API on the ADM interface. mac-01 lives on ADM, so it talks to the
-# router's ADM IP directly (intra-zone). The LAN IP 10.19.0.1 only worked while ADM->LAN was wide
-# open; the tight ADM->LAN policy (pinholes only) now blocks it. inventory/ARP are read from here.
+# OPNsense is addressed by HOSTNAME, never by IP (standard #3). The name comes from the router's
+# own 1Password item URL and is resolved by the system resolver — which IS OPNsense — so the chain
+# terminates at the authority in one hop and nothing in this file needs to know an address. That
+# moves the last bootstrap seed out of the code and into OS network config, where the network
+# maintains it. Addressing by name is also what makes TLS verification possible at all.
+# Costs one extra `op item get` at startup; the alternative is a constant that can go stale.
+OPN_HOST = (hostof(full(opn["id"])) if opn else "") or "opn-01.wblv.uk"
 vendor, arp_mac, inventory = {}, {}, {}
 if OPN:
     try:
-        for e in json.loads(curl(f"https://{OGW}/api/diagnostics/interface/get_arp", "-u", f"{OPN['k']}:{OPN['s']}") or "[]"):
+        for e in json.loads(curl(f"https://{OPN_HOST}/api/diagnostics/interface/get_arp", "-u", f"{OPN['k']}:{OPN['s']}", verify=True) or "[]"):
             if e.get("manufacturer"): vendor[e["ip"]] = e["manufacturer"]
             if e.get("ip") and e.get("mac"): arp_mac[e["ip"]] = e["mac"].lower()
     except Exception: pass
     # authoritative inventory = OPNsense Dnsmasq host entries
     try:
-        dj = json.loads(curl(f"https://{OGW}/api/dnsmasq/settings/get", "-u", f"{OPN['k']}:{OPN['s']}") or "{}")
+        dj = json.loads(curl(f"https://{OPN_HOST}/api/dnsmasq/settings/get", "-u", f"{OPN['k']}:{OPN['s']}", verify=True) or "{}")
         for h in (dj.get("dnsmasq", {}).get("hosts", {}) or {}).values():
             nm = h.get("host", "");  dom = h.get("domain", "")
             if not nm: continue
@@ -154,7 +162,8 @@ def alive(role, ip, iid):
     """Real read-only auth test. Returns (ok: bool, detail). Only called where a cred exists."""
     try:
         if role == "opnsense":
-            r = curl(f"https://{ip}/api/core/firmware/status", "-u", f"{OPN['k']}:{OPN['s']}")
+            # hostname, not the passed ip — verification needs a name (see curl docstring)
+            r = curl(f"https://{OPN_HOST}/api/core/firmware/status", "-u", f"{OPN['k']}:{OPN['s']}", verify=True)
             j = json.loads(r or "{}"); v = j.get("product_version")
             return (bool(v), f"OPNsense {v}" if v else "auth failed")
         if role == "synology":
@@ -222,10 +231,10 @@ def probe(name):
     role = role_of(name)
     access, port, verb = ROLE_PROFILE.get(role, ("host / no mgmt tool", None, "—"))
     iid = cred_item.get(name)                             # read-only cred, if one exists
-    # mac-01 is on ADM; it reaches the router on its ADM IP (10.19.10.1), not the LAN IP the
-    # inventory lists for opn-01 — that path is closed by the tight ADM->LAN policy. Probe the
-    # address mac-01 can actually reach so the router isn't falsely reported down.
-    probe_ip = OGW if role == "opnsense" else ip
+    # No special case for opn-01 any more: lab-9 repointed its reservation and DNS record to the
+    # ADM address, so the inventory IP is the one mac-01 can actually reach. Probing the inventory
+    # entry (rather than a constant) is also what makes the IPAM drift check meaningful for it.
+    probe_ip = ip
     port_open = nc_open(probe_ip, port) if (port and probe_ip) else False
     reach = port_open or (ping_ok(probe_ip) if probe_ip else False)   # REACH: heartbeat (mgmt port OR ICMP)
     if iid and port_open and role in ROLE_PROFILE and role != "tplink-ap":

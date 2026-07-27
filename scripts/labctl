@@ -25,12 +25,14 @@ hosts)
   ;;
 opnsense|opn)
   id="$(item_id 'OPN')"; [ -n "$id" ] || { echo "no OPNsense creds in vault" >&2; exit 1; }
-  # mac-01 is on ADM; reach OPNsense on its ADM interface (10.19.10.1). The item URL is the hostname
-  # opn-01.wblv.uk (which resolves to the LAN IP that the tight ADM->LAN policy now blocks), so the
-  # numeric-IP grep finds nothing and this ADM fallback is what actually gets used.
-  host="$(item_url "$id" | grep -oE 'https://[0-9.]+' | head -1)"; host="${host:-https://10.19.10.1}"
+  # Hostname, never an IP (standard #3). The old numeric-IP grep + hardcoded ADM fallback is
+  # obsolete: lab-9 repointed opn-01.wblv.uk to the ADM address on 2026-07-24, so the name now
+  # resolves to the interface mac-01 can actually reach. Addressing by name is also what lets TLS
+  # be verified for real — the LE wildcard is valid for the hostname and can never match a bare IP,
+  # which is the only reason this call previously needed -k.
+  h="$(item_url "$id" | sed -E 's#https?://##;s#[/,].*##;s#:.*##' | head -1)"; h="${h:-opn-01.wblv.uk}"
   K="$(field "$id" label=Key)"; K="${K#key=}"; S="$(field "$id" label=Secret)"; S="${S#secret=}"
-  curl -sk -u "$K:$S" --max-time 15 "$host/api/${1:-core/firmware/status}"
+  curl -s -u "$K:$S" --max-time 15 "https://${h}/api/${1:-core/firmware/status}"
   ;;
 nas)
   id="$(item_id 'NAS')"; [ -n "$id" ] || { echo "no NAS creds in vault" >&2; exit 1; }
