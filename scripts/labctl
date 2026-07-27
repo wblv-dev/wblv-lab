@@ -19,6 +19,8 @@ read-only 1Password vault holding only lab hosts. Every path is a GET / show / r
 login: labctl can look, never touch. Device changes are done by hand, deliberately.
 
   labctl hosts                 inventory + reach/auth/drift — run this first
+  labctl hosts <name>          detail for one host (accepts opn-01, wblv-opn-01,
+                               or opn-01.wblv.uk — whichever form you have)
   labctl opnsense <api/path>   GET an OPNsense read-only API endpoint
                                (default: core/firmware/status)
   labctl nas shares            list readable NAS shares

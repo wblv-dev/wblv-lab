@@ -14,6 +14,10 @@ import os, sys, subprocess, json, re, time
 from concurrent.futures import ThreadPoolExecutor
 
 JSON = "--json" in sys.argv
+# Optional positional host filter: `labctl hosts opn-01`. A name is a FILTER, not a subcommand,
+# so the surface does not grow per device. Resolved against inventory once that is loaded.
+_positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+HOST_QUERY = _positional[0] if _positional else ""
 TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 HELPER = os.path.expanduser("~/.config/wblv/switch_show.py")
 RPI_HELPER = os.path.expanduser("~/.config/wblv/rpi_show.py")
@@ -259,17 +263,37 @@ def probe(name):
     port_open = nc_open(probe_ip, port) if (port and probe_ip) else False
     reach = port_open or (ping_ok(probe_ip) if probe_ip else False)   # REACH: heartbeat (mgmt port OR ICMP)
     if iid and port_open and role in ROLE_PROFILE and role != "tplink-ap":
-        auth = alive(role, probe_ip, iid)[0]              # AUTH: did a read-only login/query succeed?
+        auth, detail = alive(role, probe_ip, iid)         # AUTH: did a read-only login/query succeed?
     else:
-        auth = None                                       # no creds / no read-only interface → n/a
+        auth, detail = None, ("no read-only handler for this role" if not iid
+                              else "mgmt port closed — not attempted")
     return {"host": name, "fqdn": fqdn, "ip": ip or None, "mac": mac or None,
             "role": role or "?", "has_creds": bool(iid), "reach": reach, "auth": auth,
-            "use": verb, "drift": drift_of(ip, mac)}
+            "auth_detail": detail, "access": access, "use": verb, "drift": drift_of(ip, mac)}
 
 # Parallelised (lab-20d): per-host probes are independent and I/O-bound (nc/ping/curl/ssh), so
 # wall-clock drops from sum-of-hosts (~39s serial) to the slowest single host. ex.map preserves
 # order so the table stays name-sorted; the lone DSM login stays single (no concurrent NAS auth).
+def resolve_query(q):
+    """Match a user-supplied name against inventory. Accepts every form the estate actually uses:
+    the short DNS name (opn-01), the device hostname convention (wblv-opn-01), and the FQDN
+    (opn-01.wblv.uk), case-insensitively. Returns None if there is no match — the caller then
+    fails loudly AND lists what does exist, because 'no such host' is only useful with the
+    alternatives attached."""
+    q = q.strip().lower().rstrip(".")
+    for n in sorted(inventory):
+        fq = (inventory[n].get("fqdn") or "").lower()
+        if q in {n.lower(), fq, fq.split(".")[0], f"wblv-{n.lower()}"}:
+            return n
+    return None
+
 _names = sorted(inventory)
+if HOST_QUERY:
+    _match = resolve_query(HOST_QUERY)
+    if not _match:
+        die(f"no host '{HOST_QUERY}' in inventory. Known hosts: {', '.join(_names)}",
+            known_hosts=_names)
+    _names = [_match]
 with ThreadPoolExecutor(max_workers=min(8, len(_names)) or 1) as _ex:
     rows = list(_ex.map(probe, _names))
 
@@ -286,6 +310,20 @@ else:
     print(f"inventory: OPNsense host entries   creds: {VAULT} (read-only, by hostname)")
     print(f"1P substrate: OK   op-token age: {TOKEN_AGE_DAYS}d (mtime → lab-61)")
     print("REACH = mgmt-port/ICMP heartbeat   AUTH = read-only login (ok / fail / — = no creds)")
+    # Single-host view: the table shape wastes a screen on one row, and the per-host detail
+    # (auth_detail, access method, how to query it) is the point of asking about one host.
+    if HOST_QUERY:
+        r = rows[0]
+        print()
+        print(f"{r['fqdn'] or r['host']}")
+        print(f"  {'role':<10}{r['role']}")
+        print(f"  {'address':<10}{r['ip'] or '—'}   mac {r['mac'] or '—'}")
+        print(f"  {'reach':<10}{R(r['reach']):<6}{r['access']}")
+        print(f"  {'auth':<10}{A(r['auth']):<6}{r['auth_detail']}")
+        print(f"  {'creds':<10}{(VAULT + ' (read-only, by hostname)') if r['has_creds'] else 'none in vault'}")
+        print(f"  {'query':<10}{r['use']}")
+        print(f"  {'ipam':<10}{r['drift']}")
+        sys.exit(0)
     hdr = f"{'HOST':<10}{'IP':<15}{'MAC':<20}{'REACH':<7}{'AUTH'}"
     print(hdr); print("-" * len(hdr))
     for r in rows:

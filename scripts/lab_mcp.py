@@ -126,13 +126,18 @@ def _slice_rows(out, limit, action):
 
 @mcp.tool(title="Lab inventory + liveness",
           annotations=ToolAnnotations(title="Lab inventory + liveness", **RO))
-def lab_hosts() -> str:
+def lab_hosts(host: str = "") -> str:
     """List the lab inventory as JSON, sourced from OPNsense host entries (the authoritative IPAM).
     Per host: ip, mac, role, has_creds, and TWO liveness signals — `reach` (mgmt-port/ICMP heartbeat:
     is it up on the network) and `auth` (did a READ-ONLY login/query actually succeed: true/false, or
     null where there are no creds / no read-only interface). Plus an `ipam_drift` check (inventory vs
-    live ARP). Call this FIRST to see what you can actually reach before querying a specific host."""
-    return _run(["hosts", "--json"])
+    live ARP). Call this FIRST to see what you can actually reach before querying a specific host.
+
+    Pass `host` to get detail for one host instead of the whole estate — accepts the short name
+    (opn-01), the device hostname (wblv-opn-01) or the FQDN. Much faster, since only that host is
+    probed, and it includes the auth detail string (firmware version, or why a probe failed).
+    An unknown name is an error listing the hosts that DO exist, never an empty result."""
+    return _run(["hosts", "--json"] + ([host] if host else []))
 
 @mcp.tool(title="OPNsense read-only API",
           annotations=ToolAnnotations(title="OPNsense read-only API", idempotentHint=True, **RO))
