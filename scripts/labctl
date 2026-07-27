@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
-# labctl — READ-ONLY access to the WBLV lab. Creds live in a dedicated 1Password vault (auto-detected: the
-# single vault the service account can see). That vault holds ONLY lab hosts, so discovery is naturally scoped.
-#   labctl hosts                 list lab hosts (from 1Password) + type + reachability
-#   labctl opnsense <api/path>   GET an OPNsense read-only API endpoint (default: core/firmware/status)
-#   labctl nas shares            list readable NAS shares
-#   labctl nas ls <folder>       list a NAS folder (read-only)
-#   labctl switch "<show cmd>"   run an Aruba operator (show-only) command
-#   labctl help
+# labctl — READ-ONLY control plane for the WBLV lab.
+# Inventory: OPNsense (authoritative IPAM). Credentials: a dedicated read-only 1Password vault.
+# Usage text lives in HELP() below — do NOT restate it here, or the two will drift.
 set -uo pipefail
 TF="$HOME/.config/wblv/op-token"
 [ -s "$TF" ] || { echo "labctl: no op token at $TF" >&2; exit 1; }
 export OP_SERVICE_ACCOUNT_TOKEN="$(cat "$TF")"
 V="$(op vault list --format json 2>/dev/null | jq -r '.[0].name // empty')"
 [ -n "$V" ] || { echo "labctl: service account sees no vault" >&2; exit 1; }
-HELP(){ grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; }
+# Usage is an explicit block, NOT scraped from comments. The previous version grepped every
+# column-0 comment in this file, so any explanatory comment added later silently became help
+# text — which is how two internal design notes ended up printed to users.
+HELP(){ cat <<'USAGE'
+labctl — READ-ONLY access to the WBLV lab.
+
+Inventory comes from OPNsense (the authoritative IPAM); credentials from a dedicated,
+read-only 1Password vault holding only lab hosts. Every path is a GET / show / read-only
+login: labctl can look, never touch. Device changes are done by hand, deliberately.
+
+  labctl hosts                 inventory + reach/auth/drift — run this first
+  labctl opnsense <api/path>   GET an OPNsense read-only API endpoint
+                               (default: core/firmware/status)
+  labctl nas shares            list readable NAS shares
+  labctl nas ls <folder>       list a NAS folder
+  labctl switch "<show cmd>"   run an Aruba operator (show-only) command
+  labctl help                  this text
+
+Exit codes: 0 ok · 1 fault (creds, host, or device error) · 2 usage error
+USAGE
+}
 item_id(){ op item list --vault "$V" --format json 2>/dev/null | jq -r --arg re "$1" '.[]|select(.title|test($re;"i"))|.id' | head -1; }
 field(){ op item get "$1" --vault "$V" --fields "$2" --reveal 2>/dev/null; }
 item_url(){ op item get "$1" --vault "$V" --format json 2>/dev/null | jq -r '(.urls//[]|map(.href)|join(","))'; }
