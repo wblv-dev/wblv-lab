@@ -206,12 +206,33 @@ def alive(role, ip, iid):
             P = P[9:] if P.startswith("password=") else P
             if not (U and P):
                 return (None, "cred fetch failed (1P)")   # 1P hiccup, not auth failure (lab-22)
-            # read-only SSH as the no-sudo 'claude' user; the localhost DNS query doubles as an
-            # auth proof AND a Pi-hole resolver-health proof (must resolve + forward wblv.uk)
-            r = subprocess.run([RPI_HELPER, ip, U, "dig +short @127.0.0.1 nas-01.wblv.uk"],
+            # Read-only SSH as the no-sudo 'claude' user. The localhost DNS query is a TRIPLE proof:
+            # SSH auth succeeded, the Pi's resolver answers, and it forwards the lab domain to
+            # OPNsense correctly.
+            #
+            # The answer is validated against OPNsense inventory, not a hardcoded address, so both
+            # sides of the comparison are live. Two reasons this matters:
+            #  - a hardcoded expectation reports the PI as broken whenever IPAM legitimately changes,
+            #    sending you to debug the wrong host entirely;
+            #  - merely checking "did it return an IPv4?" is worse still, because Pi-hole answers
+            #    BLOCKED names with 0.0.0.0 — that passes a shape test, so a real DNS fault would be
+            #    reported healthy. A false green light is more expensive than a false red one.
+            probe = inventory.get("nas-01") or {}
+            expect, fqdn = probe.get("ip", ""), probe.get("fqdn", "")
+            if not (expect and fqdn):
+                return (None, "cannot verify: probe target missing from OPNsense inventory")
+            r = subprocess.run([RPI_HELPER, ip, U, f"dig +short @127.0.0.1 {fqdn}"],
                                env={**os.environ, "RPI_PW": P}, capture_output=True, text=True, timeout=30)
-            ok = "10.19.10.10" in r.stdout
-            return (ok, "ssh + pihole resolve ok" if ok else "ssh/login or resolve failed")
+            if r.returncode != 0:
+                return (False, "ssh/login failed")      # rpi_show.py: 2 = no prompt, 3 = auth failed
+            got = next((l.strip() for l in r.stdout.splitlines()
+                        if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", l.strip())), "")
+            if not got:
+                return (False, f"ssh ok but the Pi returned no A record for {fqdn}")
+            if got != expect:
+                return (False, f"ssh ok but the Pi resolved {fqdn} -> {got}; OPNsense says {expect}"
+                               + (" (0.0.0.0 = Pi-hole is BLOCKING a lab name)" if got == "0.0.0.0" else ""))
+            return (True, "ssh + pihole resolve ok")
     except Exception as e:
         return (False, f"err {type(e).__name__}")
     return (None, "no handler")
