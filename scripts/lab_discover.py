@@ -21,11 +21,11 @@ from concurrent.futures import ThreadPoolExecutor
 # inventory, reachability and the command surface all follow from those four.
 ROLE_BY_PREFIX = {"nas": "synology", "opn": "opnsense", "swt": "aruba-switch", "wap": "tplink-ap", "rpi": "raspberry-pi"}
 ROLE_PROFILE = {
-    "synology":     ("DSM API :5001 + SMB :445",        5001, "labctl nas"),
-    "aruba-switch": ("SSH operator :22 (show-only)",    22,   'labctl switch "<cmd>"'),
-    "opnsense":     ("REST API :443",                   443,  "labctl opnsense <path>"),
+    "synology":     ("DSM API :5001 + SMB :445",        5001, "labctl <host> ?"),
+    "aruba-switch": ("SSH operator :22 (show-only)",    22,   "labctl <host> ?"),
+    "opnsense":     ("REST API :443",                   443,  "labctl <host> ?"),
     "tplink-ap":    ("web UI :80/443 (no RO handler)",  443,  "—"),
-    "raspberry-pi": ("SSH :22 (read-only claude)",      22,   'labctl rpi "<cmd>"'),
+    "raspberry-pi": ("SSH :22 (read-only claude)",      22,   "labctl <host> ?"),
 }
 def role_of(name): return ROLE_BY_PREFIX.get(name.split("-")[0].lower())
 
@@ -334,7 +334,7 @@ else:
         print(f"  {'reach':<10}{R(r['reach']):<6}{r['access']}")
         print(f"  {'auth':<10}{A(r['auth']):<6}{r['auth_detail']}")
         print(f"  {'creds':<10}{(VAULT + ' (read-only, by hostname)') if r['has_creds'] else 'none in vault'}")
-        print(f"  {'query':<10}{r['use']}")
+        print(f"  {'query':<10}labctl {r['host']} ?   (ask the device what it can answer)")
         print(f"  {'ipam':<10}{r['drift']}")
         sys.exit(0)
     hdr = f"{'HOST':<10}{'IP':<15}{'MAC':<20}{'REACH':<7}{'AUTH'}"
