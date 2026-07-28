@@ -20,6 +20,8 @@ except ImportError:
     pexpect = None   # SSH probes report this rather than failing silently
 from concurrent.futures import ThreadPoolExecutor
 
+_T0 = time.time()          # for the Runtime stat: measured, not estimated
+
 TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 
 # The one convention this tool assumes: hostnames are prefixed by device type. It is Harry's
@@ -100,7 +102,7 @@ if not TOKEN:
     die(f"op-token is empty at {TOKEN_PATH}")
 
 ENV = {**os.environ, "OP_SERVICE_ACCOUNT_TOKEN": TOKEN}
-TOKEN_AGE_DAYS = round((time.time() - os.path.getmtime(TOKEN_PATH)) / 86400, 1)
+TOKEN_FILE_AGE_DAYS = round((time.time() - os.path.getmtime(TOKEN_PATH)) / 86400, 1)
 
 
 def op(*args, timeout=15):
@@ -122,13 +124,13 @@ if _who.returncode != 0:
              if any(k in e for k in ("unauthor", "invalid", "401", "403", "expired", "token"))
              else "op whoami failed")
     die(f"1Password substrate check failed: {cause}",
-        detail=(_who.stderr or "").strip()[:200], token_age_days=TOKEN_AGE_DAYS)
+        detail=(_who.stderr or "").strip()[:200], token_file_age_days=TOKEN_FILE_AGE_DAYS)
 
 VAULT = next((v["name"] for v in json.loads(op("vault", "list", "--format", "json") or "[]")
               if "claude" in v.get("name", "").lower()), "")
 if not VAULT:
     die("the service account can see no Claude-scoped vault (token valid but mis-scoped?)",
-        token_age_days=TOKEN_AGE_DAYS)
+        token_file_age_days=TOKEN_FILE_AGE_DAYS)
 
 
 # --- membership: the vault decides what is a lab member ------------------------------------
@@ -162,7 +164,7 @@ def _member(item):
 items = json.loads(op("item", "list", "--vault", VAULT, "--format", "json") or "[]")
 if not items:
     die(f"vault '{VAULT}' returned no items (1P read hiccup, or nothing is registered)",
-        token_age_days=TOKEN_AGE_DAYS)
+        token_file_age_days=TOKEN_FILE_AGE_DAYS)
 
 with ThreadPoolExecutor(max_workers=8) as ex:          # per-item `op item get` is the slow part
     members = [m for m in ex.map(_member, items) if m]
@@ -436,7 +438,7 @@ def render(rows, meta):
 
     field("Vault", meta["vault"])
     field("Source", meta["ipam_source"])
-    field("Token age", f"{meta['token_age_days']}d")
+    field("Runtime", f"{meta['runtime_s']}s")
     con.print()
 
     if not rows:
@@ -505,7 +507,12 @@ def render(rows, meta):
 if __name__ == "__main__":
     shown = rows                       # WANT was applied before the probes, not after them
 
-    meta = {"vault": VAULT, "token_age_days": TOKEN_AGE_DAYS, "ipam_source": opn["endpoint"]}
+    # Token age is the age of the token FILE, not time until expiry — 1Password exposes no
+    # expiry to read. It stays in --json as a diagnostic, named for what it measures, and is
+    # kept off the table so it cannot be mistaken for a warning.
+    meta = {"vault": VAULT, "ipam_source": opn["endpoint"],
+            "runtime_s": round(time.time() - _T0, 1),
+            "token_file_age_days": TOKEN_FILE_AGE_DAYS}
     if "--json" in sys.argv:
         # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
         KEEP = ("name", "kind", "source", "kind_drift", "fqdn", "ip", "mac", "vendor", "role",
