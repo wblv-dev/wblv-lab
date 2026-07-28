@@ -173,7 +173,11 @@ def _member(item):
     if "/" in norm and not norm.endswith("/CLAUDE"):
         return None
     full = json.loads(op("item", "get", item["id"], "--vault", VAULT, "--format", "json") or "{}")
-    href = ";".join(u.get("href", "") for u in (full.get("urls") or []))
+    # Any slot may carry the URL: the built-in website entry, or a custom field. Reading only
+    # the urls array meant a correctly-built item had no endpoint at all.
+    href = ";".join([u.get("href", "") or "" for u in (full.get("urls") or [])] +
+                    [f.get("value") or "" for f in (full.get("fields") or [])
+                     if "://" in (f.get("value") or "")])
     # Any scheme, not just http(s): an SSH-managed host should be able to say so, rather than
     # being described by a web URL it does not serve. The scheme is how you reach it.
     m = re.search(r"([a-z][a-z0-9+.\-]*)://([A-Za-z0-9.\-]+)(?::(\d+))?", href, re.I)
@@ -268,9 +272,10 @@ if not opn:
 # Every item's fields were already read when membership was resolved. Fetching this one
 # again cost a second `op item get` — about a second — for bytes we were already holding.
 _f = CREDS.get(opn["id"], {})
-K, S = _f.get("key", "").removeprefix("key="), _f.get("secret", "").removeprefix("secret=")
+K = (_f.get("api_key") or _f.get("key") or "").removeprefix("key=")
+S = (_f.get("api_secret") or _f.get("secret") or "").removeprefix("secret=")
 if not (K and S):
-    die(f"the OPNsense item '{opn['item']}' has no Key/Secret fields")
+    die(f"the OPNsense item '{opn['item']}' has no API Key / API Secret fields")
 
 API = f"https://{opn['endpoint']}/api"
 inventory, arp = {}, {}
@@ -290,6 +295,14 @@ try:
 except Exception:
     die(f"could not read the IPAM from {opn['endpoint']}",
         hint="OPNsense is the inventory authority; without it there is no lab directory")
+
+if not inventory:
+    # Empty is not "no reservations" — it is a read that failed without raising. Left alone it
+    # yields a full table with every address, MAC and zone blank, and every host flagged as
+    # type-drifted because the wire appears to say nothing. Confident and wrong is the one
+    # outcome this tool may not produce.
+    die(f"the IPAM at {opn['endpoint'] or '(no endpoint)'} returned no host entries",
+        hint="the OPNsense member has no usable endpoint, or its API credential was rejected")
 
 try:
     # Keyed by MAC, not by the reserved IP. A host that is live on a different address than
@@ -467,7 +480,8 @@ def auth_probe(r):
         if not host:
             return None, "no endpoint to test"
         if r["platform"] == "opnsense":
-            k = c.get("key", "").removeprefix("key="); sec = c.get("secret", "").removeprefix("secret=")
+            k = (c.get("api_key") or c.get("key") or "").removeprefix("key=")
+            sec = (c.get("api_secret") or c.get("secret") or "").removeprefix("secret=")
             j = json.loads(curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}") or "{}")
             v = j.get("product_version")
             return (bool(v), f"OPNsense {v}" if v else "API rejected the credential")
