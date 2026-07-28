@@ -1,5 +1,12 @@
-#!/usr/bin/env -S uv run --with mcp --quiet --script
+#!/usr/bin/env -S uv run --with mcp<2 --quiet --script
 """wblv-lab as an MCP tool — one tool, read-only, no state.
+
+THE PIN IS LOAD-BEARING
+`mcp` is pinned below 2.0. The 2.0 release removed `mcp.server.fastmcp` outright, and an
+unpinned dependency in a shebang means this server can stop working without anyone touching
+the repository — which is exactly what happened: the CLI kept working, the MCP surface went
+dark, and nothing said why until it was tested. Moving to the 2.x API is real work; do it
+deliberately rather than by accident.
 
 WHY THIS SHELLS OUT INSTEAD OF IMPORTING
 wblv_lab.py does its work at module level, so importing it would run the probes exactly once

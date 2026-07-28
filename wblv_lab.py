@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run --with pexpect --with rich --quiet --script
+#!/usr/bin/env -S uv run --with pexpect<5 --with rich<16 --quiet --script
 """wblv-lab — what is alive in the lab, and how to reach it.
 
 A directory, not a broker. It reports members, their state and their access route, then
