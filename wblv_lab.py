@@ -77,9 +77,15 @@ cached — every run asks again, which costs a few seconds and buys accuracy.
 REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can answer on
 the network and still be useless to you.
 
-FAULT names a field that is wrong in the VAULT ENTRY, not a problem with the host --
-'url' means the item's URL field holds no usable hostname, 'tag' that its declared kind
-and the wire disagree. Blank is healthy. The detail is in --json.
+ZONE is the OPNsense interface the host answers on. LAN cannot reach ADM, so it is often
+why a host is unreachable, or legitimately is not.
+
+FAULT names what disagrees, and is blank when nothing does. 'url' -- the item's URL field
+holds no usable hostname. 'ip' -- the DHCP reservation and the live address differ, a lease
+that outlived the change which created it. 'tag' -- the declared type and the wire disagree.
+
+Non-members counts addresses OPNsense can see that no vault item claims. It says how much
+of the wire this directory accounts for; it is not a fault.
 
 This tool tells you which credential opens a host. It does not turn the key — you connect
 and run commands yourself, so the read-only limit lives in the host account."""
@@ -217,15 +223,18 @@ except Exception:
         hint="OPNsense is the inventory authority; without it there is no lab directory")
 
 try:
+    # Keyed by MAC, not by the reserved IP. A host that is live on a different address than
+    # its reservation would silently fall out of an IP-keyed lookup, and the missing vendor
+    # would read as "aged out of ARP" — a data drift disguised as a stale cache entry.
     for e in json.loads(_arp.result() or "[]"):
-        if e.get("ip"):
-            arp[e["ip"]] = e.get("manufacturer", "")
+        if e.get("mac"):
+            arp[e["mac"].lower()] = e
 except Exception:
-    pass                                   # vendor is enrichment, not load-bearing
+    pass                                   # vendor and zone are enrichment, not load-bearing
 
 
 # --- classify -------------------------------------------------------------------------------
-TAG_KINDS = ("physical", "virtual", "service")
+TAG_TYPES = ("physical", "virtual", "service")
 
 def classify(m):
     """Two independent answers to the same question, kept apart on purpose.
@@ -240,9 +249,14 @@ def classify(m):
     signal is discarded, because each catches what the other cannot."""
     inv = inventory.get(m["name"], {})
     role, proto, port = ROLES.get(m["name"][:3], ("", "", None))
-    vendor = arp.get(inv.get("ip", ""), "")
+    _a = arp.get(inv.get("mac", ""), {})
+    vendor = _a.get("manufacturer", "")
+    zone = _a.get("intf_description", "")      # LAN / ADM / PLY, straight off the interface
+    # The reservation says where it should be; ARP says where it is. Disagreement is the
+    # lease that outlived the misconfig which created it — silent until someone looks.
+    ip_drift = bool(_a.get("ip") and inv.get("ip") and _a["ip"] != inv["ip"])
 
-    declared = next((t.lower() for t in m["tags"] if t.lower() in TAG_KINDS), "")
+    declared = next((t.lower() for t in m["tags"] if t.lower() in TAG_TYPES), "")
     if not inv:
         observed = "service"                  # no IPAM entry: a SaaS tenant, not a machine
     elif any(h in vendor.lower() for h in HYPERVISORS):
@@ -257,10 +271,11 @@ def classify(m):
     return {**m, **inv, "role": role, "port": port,
             "access": (f"{proto}://{inv.get('fqdn') or m['endpoint']}:{port}"
                        if port and (inv.get('fqdn') or m['endpoint']) else ""),
-            "vendor": vendor,
-            "kind": declared or observed or "unclassified",
+            "vendor": vendor, "zone": zone,
+            "live_ip": _a.get("ip", ""), "ip_drift": ip_drift,
+            "type": declared or observed or "unclassified",
             "source": "tag" if declared else ("wire" if observed else "none"),
-            "kind_drift": drift}
+            "type_drift": drift}
 
 
 # --- REACH and AUTH: measured, never recorded ----------------------------------------------
@@ -412,10 +427,16 @@ def probe(r):
 
 # Filtering here rather than at print time: a filtered view has no reason to probe hosts it
 # will not show, and `-s` was paying for five host probes to print one service row.
-_classified = [c for c in (classify(m) for m in members) if not WANT or c["kind"] in WANT]
+_all = [classify(m) for m in members]
+# How much of the wire the directory accounts for. A property of the DIRECTORY, not of any
+# host, which is why it is counted here and not attached to a row. Counted before the filter,
+# because a filtered view does not make the rest of the lab stop existing.
+_member_macs = {r["mac"] for r in _all if r.get("mac")}
+OFF_DIRECTORY = sum(1 for mac in arp if mac not in _member_macs)
+_classified = [c for c in _all if not WANT or c["type"] in WANT]
 with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; NAS stays single
     rows = list(ex.map(probe, _classified))
-rows.sort(key=lambda r: (r["kind"] == "service", r["name"]))
+rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 
 def render(rows, meta):
     """A table for humans. Colour encodes STATE and nothing else — green up, red down, dim
@@ -449,7 +470,7 @@ def render(rows, meta):
         con.print("[dim]no members match[/]")
         return
 
-    hosts = sum(1 for r in rows if r["kind"] != "service")
+    hosts = sum(1 for r in rows if r["type"] != "service")
     reachable = sum(1 for r in rows if r["reach"] is True)
     authed = sum(1 for r in rows if r["auth"] is True)
     tested = sum(1 for r in rows if r["auth"] is not None)
@@ -459,6 +480,7 @@ def render(rows, meta):
           "green" if reachable == len(rows) else "yellow")
     field("Authenticated", f"{authed}/{tested}",
           "green" if tested and authed == tested else "yellow" if authed else "red")
+    field("Non-members", meta["off_directory"])
     con.print()
 
     # SIMPLE without an edge is the only box that starts at column 0 — every bordered style
@@ -470,8 +492,12 @@ def render(rows, meta):
     # min_width floor. Narrowing therefore lands on CREDENTIAL, which has wrap points, instead
     # of collapsing the columns that answer the actual question.
     t.add_column("HOST", style="bold", no_wrap=True)
-    t.add_column("KIND", no_wrap=True)
+    t.add_column("TYPE", no_wrap=True)
     t.add_column("ADDRESS", no_wrap=True)
+    # Zone sits beside the address because it qualifies it: it is why a host is reachable, or
+    # legitimately is not. LAN cannot reach ADM, so an unreachable PLY host is the firewall
+    # working, not a fault — and without this the two are indistinguishable in the output.
+    t.add_column("ZONE", no_wrap=True)
     t.add_column("MAC", style="grey50", no_wrap=True)
     t.add_column("REACH", justify="center", no_wrap=True, min_width=5)
     t.add_column("AUTH", justify="center", no_wrap=True, min_width=4)
@@ -483,13 +509,14 @@ def render(rows, meta):
     # field renders exactly like a service that legitimately has no endpoint.
     t.add_column("FAULT", style="red", no_wrap=True)
 
-    KIND = {"physical": "default", "virtual": "cyan", "service": "magenta",
+    TYPE = {"physical": "default", "virtual": "cyan", "service": "magenta",
             "unclassified": "yellow"}
     DASH = "[grey35]-[/]"
     for r in rows:
         t.add_row(r["name"],
-                  f"[{KIND.get(r['kind'], 'yellow')}]{r['kind']}[/]",
+                  f"[{TYPE.get(r['type'], 'yellow')}]{r['type']}[/]",
                   r.get("ip") or DASH,
+                  r.get("zone") or DASH,
                   r.get("mac") or DASH,
                   "[green]up[/]" if r["reach"] is True else
                   "[red]down[/]" if r["reach"] is False else DASH,
@@ -498,7 +525,8 @@ def render(rows, meta):
                   r.get("access") or DASH,
                   r["item"],
                   ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
-                                            ("tag", r.get("kind_drift"))) if bad))
+                                            ("ip", r.get("ip_drift")),
+                                            ("tag", r.get("type_drift"))) if bad))
 
     # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
     # column down to a single character — a stack of ellipses that looks like output while
@@ -522,13 +550,13 @@ if __name__ == "__main__":
     # expiry to read. It stays in --json as a diagnostic, named for what it measures, and is
     # kept off the table so it cannot be mistaken for a warning.
     meta = {"vault": VAULT, "ipam_source": opn["endpoint"],
-            "runtime_s": round(time.time() - _T0, 1),
+            "runtime_s": round(time.time() - _T0, 1), "off_directory": OFF_DIRECTORY,
             "token_file_age_days": TOKEN_FILE_AGE_DAYS}
     if "--json" in sys.argv:
         # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
-        KEEP = ("name", "kind", "source", "kind_drift", "fqdn", "ip", "mac", "vendor", "role",
+        KEEP = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
                 "access", "reach", "auth", "auth_detail", "item", "account", "endpoint",
-                "endpoint_malformed")
+                "endpoint_malformed", "zone", "live_ip", "ip_drift")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},
                          indent=2))
     else:

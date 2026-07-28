@@ -24,7 +24,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 CLI = Path(__file__).resolve().parent / "wblv_lab.py"
-KINDS = {"physical": "-p", "virtual": "-v", "service": "-s"}
+TYPES = {"physical": "-p", "virtual": "-v", "service": "-s"}
 TIMEOUT = 120   # every probe is bounded and they run in parallel; this is the outer backstop
 
 mcp = FastMCP("wblv-lab")
@@ -39,13 +39,23 @@ mcp = FastMCP("wblv-lab")
         openWorldHint=True,     # answers come off the network, not from a fixed set
     )
 )
-def wblv_lab(kind: str = "") -> str:
+def wblv_lab(type: str = "") -> str:
     """What is alive in the lab and how to reach it.
 
-    Returns every lab member with its address, MAC, whether it is reachable, whether a real
-    read-only login actually succeeded, the URI to connect on, and which 1Password item holds
-    the credential. Read the credential yourself and connect to the host directly — this tool
-    reports, it does not broker.
+    Returns every lab member with its address, zone, MAC, whether it is reachable, whether a
+    real read-only login actually succeeded, the URI to connect on, and which 1Password item
+    holds the credential. Read the credential yourself and connect to the host directly — this
+    tool reports, it does not broker.
+
+    ZONE is the OPNsense interface a host answers on (LAN / ADM / PLY). LAN cannot reach ADM,
+    so it is frequently the reason a host is unreachable rather than broken.
+
+    FAULT-bearing fields describe the VAULT ENTRY or the IPAM, not the host: endpoint_malformed
+    (the item's URL field holds no usable hostname), ip_drift (the DHCP reservation and the
+    live address disagree), type_drift (the declared type and the wire disagree).
+
+    off_directory counts addresses OPNsense can see that no vault item claims — how much of
+    the wire this directory accounts for.
 
     Membership comes from 1Password, detail from OPNsense, and state from a live probe run on
     every call. Nothing is cached, so a result is true when you receive it and not before.
@@ -55,12 +65,12 @@ def wblv_lab(kind: str = "") -> str:
     genuinely succeeded. Trust AUTH.
 
     Args:
-        kind: optional filter — "physical", "virtual" or "service". Empty returns everything.
+        type: optional filter — "physical", "virtual" or "service". Empty returns everything.
     """
-    if kind and kind not in KINDS:
-        raise ToolError(f"unknown kind {kind!r}; expected one of {', '.join(sorted(KINDS))}")
+    if type and type not in TYPES:
+        raise ToolError(f"unknown type {type!r}; expected one of {', '.join(sorted(TYPES))}")
 
-    argv = [str(CLI), "--json"] + ([KINDS[kind]] if kind else [])
+    argv = [str(CLI), "--json"] + ([TYPES[type]] if type else [])
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
