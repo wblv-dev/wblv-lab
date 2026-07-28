@@ -177,8 +177,27 @@ def _member(item):
     is_service = any(t.lower() == "service" for t in (full.get("tags") or []))
     from_title = title.split("/")[0].strip().lower().removeprefix("wblv-")
     name = from_title if (is_service or not endpoint) else endpoint.split(".")[0].lower()
-    CREDS[name] = {(f.get("label") or "").lower(): (f.get("value") or "")
-                   for f in (full.get("fields") or [])}
+    # 1Password's Login item offers custom fields and labelled website entries, and Harry uses
+    # both — the M365 tenant_id and client_id live as LABELLED URLS because that is the slot the
+    # UI made easy. Reading only `fields` threw those labels away and made the data look like a
+    # malformed endpoint. Both are read; `fields` wins a clash, being the more deliberate slot.
+    #
+    # Labels are typed by hand in a GUI, so they are matched forgivingly: stored under both the
+    # plain lowercase form and one with spaces and hyphens folded to underscores, so "Client ID",
+    # "client-id" and "client_id" all resolve. A label that silently fails to match would look
+    # exactly like a field that was never filled in.
+    def _keys(label):
+        low = (label or "").strip().lower()
+        return {low, re.sub(r"[\s\-]+", "_", low)} - {""}
+
+    c = {}
+    for u in (full.get("urls") or []):
+        for k in _keys(u.get("label")):
+            c[k] = u.get("href") or ""
+    for f in (full.get("fields") or []):
+        for k in _keys(f.get("label")):
+            c[k] = f.get("value") or ""
+    CREDS[name] = c
     return {"item": title, "endpoint": endpoint, "account": user, "name": name,
             "scheme": scheme, "url_port": url_port,
             "endpoint_malformed": junk, "tags": full.get("tags") or []}
