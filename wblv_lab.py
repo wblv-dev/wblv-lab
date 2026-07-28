@@ -45,6 +45,11 @@ CREDS = {}
 
 # Vendor strings OPNsense resolves from the OUI. Matched on the NAME the router reports, not
 # on a local OUI table — the lookup is the device's, we only classify the answer.
+# Roles whose auth probe talks to no host, so neither an endpoint nor a successful REACH is a
+# precondition for testing them. Kept explicit: the default stays "do not attempt a login
+# against something that did not answer", which is what stops repeated probes tripping lockouts.
+HOSTLESS_ROLES = ("1password",)
+
 HYPERVISORS = ("proxmox", "vmware", "qemu", "kvm", "xen", "microsoft corporation",
                "oracle virtualbox", "nutanix", "parallels", "red hat")
 
@@ -161,7 +166,13 @@ def _member(item):
     # something to coerce. Reported as such rather than silently parsed into nonsense — the
     # M365 item holds an expiry date and two GUIDs here, which once parsed as a host named "23".
     endpoint = m.group(2) if (m and "." in m.group(2)) else ""
-    junk = bool(href) and not endpoint
+    # A missing endpoint is only a FAULT if something was clearly meant to be one. An item
+    # whose only URL-slot entries are labelled data (role: 1password) has no endpoint because it
+    # needs none — reporting that as a malformed URL would be the tool inventing a problem.
+    intended = any(("://" in (u.get("href") or "")) or
+                   (u.get("label") or "").strip().lower() in ("website", "url")
+                   for u in (full.get("urls") or []))
+    junk = intended and not endpoint
     # A service has no meaningful hostname prefix — a SaaS tenant is not identified by the
     # first three letters of its portal's DNS name — so the URL is the only thing that states
     # how to reach it. Read the scheme and port from it rather than inferring them.
@@ -411,9 +422,18 @@ def auth_probe(r):
     """A REAL read-only login, using the host's own mechanism. Returns (ok|None, detail).
     None means 'cannot be tested', which is different from 'failed' and must stay different."""
     c, host = CREDS.get(r["name"], {}), r.get("fqdn") or r["endpoint"]
-    if not host:
-        return None, "no endpoint to test"
     try:
+        if r["role"] == "1password":
+            # Deliberately ahead of the host check: this probe talks to no host. It already ran
+            # as the substrate pre-check before any member was resolved, so it costs nothing to
+            # report, and requiring a URL purely to satisfy the plumbing would be ceremony —
+            # my.1password.com being reachable proves nothing about this account.
+            w = json.loads(op("whoami", "--format", "json") or "{}")
+            return (bool(w.get("user_uuid")),
+                    f"service account on {w.get('url','?').split('//')[-1]}" if w.get("user_uuid")
+                    else "op whoami returned nothing")
+        if not host:
+            return None, "no endpoint to test"
         if r["role"] == "opnsense":
             k = c.get("key", "").removeprefix("key="); sec = c.get("secret", "").removeprefix("secret=")
             j = json.loads(curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}") or "{}")
@@ -464,22 +484,29 @@ def auth_probe(r):
         if r["role"] == "tailscale":
             # The API key's own tailnet, via the "-" alias, so no tailnet name is written down.
             # Tailscale API keys authenticate as basic auth with an empty password.
-            k = c.get("api_key", "") or c.get("password", "")
-            if not k:
-                return None, "needs an api_key field on the item"
+            # An OAuth client can be scoped (devices:read); a raw API key cannot — it is
+            # full-access and could delete or re-authorise nodes. Prefer the scoped one, and
+            # say so in the detail when the blunt instrument is in use.
+            cid, sec = c.get("client_id", ""), c.get("client_secret", "")
+            k, how = c.get("api_key", "") or c.get("password", ""), "API key (full-access)"
+            if cid and sec:
+                tok = json.loads(curl("https://api.tailscale.com/api/v2/oauth/token",
+                                      "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
+                                      "-d", "grant_type=client_credentials") or "{}")
+                k, how = tok.get("access_token", ""), "OAuth client"
+                if not k:
+                    return False, "OAuth client rejected"
+                auth = ["-H", f"Authorization: Bearer {k}"]
+            elif k:
+                auth = ["-u", f"{k}:"]
+            else:
+                return None, "needs client_id + client_secret (scoped OAuth) or api_key"
             j = json.loads(curl("https://api.tailscale.com/api/v2/tailnet/-/devices",
-                                "-u", f"{k}:") or "{}")
+                                *auth) or "{}")
             devs = j.get("devices")
             if devs is None:
                 return False, (j.get("message", "")[:60] or "API rejected the credential")
-            return True, f"{len(devs)} devices in the tailnet"
-        if r["role"] == "1password":
-            # This already ran as the substrate pre-check before any member was resolved, so it
-            # costs nothing to report. It is the most load-bearing dependency the tool has and
-            # was previously invisible in the output.
-            w = json.loads(op("whoami", "--format", "json") or "{}")
-            return (bool(w.get("user_uuid")),
-                    f"service account, {w.get('user_type','?').lower()}" if w else "op whoami failed")
+            return True, f"{len(devs)} devices, via {how}"
         return None, ""
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
@@ -502,10 +529,11 @@ def probe(r):
     answer on the network and still be useless to you, and some hosts drop ICMP entirely."""
     host = r.get("fqdn") or r["endpoint"]
     port = r.get("port")
-    if not host:
+    hostless = r["role"] in HOSTLESS_ROLES
+    if not host and not hostless:
         return {**r, "reach": None, "auth": None, "auth_detail": ""}
-    reach = reach_probe(host, port)
-    ok, detail = auth_probe(r) if reach else (None, "")
+    reach = reach_probe(host, port) if host else None
+    ok, detail = auth_probe(r) if (reach or hostless) else (None, "")
     return {**r, "reach": reach, "auth": ok, "auth_detail": detail}
 
 
