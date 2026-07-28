@@ -174,7 +174,9 @@ def _member(item):
         return None
     full = json.loads(op("item", "get", item["id"], "--vault", VAULT, "--format", "json") or "{}")
     href = ";".join(u.get("href", "") for u in (full.get("urls") or []))
-    m = re.search(r"(https?)://([A-Za-z0-9.\-]+)(?::(\d+))?", href)
+    # Any scheme, not just http(s): an SSH-managed host should be able to say so, rather than
+    # being described by a web URL it does not serve. The scheme is how you reach it.
+    m = re.search(r"([a-z][a-z0-9+.\-]*)://([A-Za-z0-9.\-]+)(?::(\d+))?", href, re.I)
     # A URL field holding something that is not a hostname is a data fault in the vault, not
     # something to coerce. Reported as such rather than silently parsed into nonsense — the
     # M365 item holds an expiry date and two GUIDs here, which once parsed as a host named "23".
@@ -189,9 +191,10 @@ def _member(item):
     # A service has no meaningful hostname prefix — a SaaS tenant is not identified by the
     # first three letters of its portal's DNS name — so the URL is the only thing that states
     # how to reach it. Read the scheme and port from it rather than inferring them.
-    scheme = m.group(1) if endpoint else ""
-    url_port = int(m.group(3)) if (endpoint and m.group(3)) else (443 if scheme == "https" else
-                                                                 80 if scheme == "http" else None)
+    scheme = (m.group(1).lower() if endpoint else "")
+    DEFAULT_PORT = {"https": 443, "http": 80, "ssh": 22}
+    url_port = (int(m.group(3)) if (endpoint and m.group(3))
+                else DEFAULT_PORT.get(scheme) if endpoint else None)
     user = next((f.get("value", "") for f in (full.get("fields") or [])
                  if (f.get("label") or "").lower() == "username"), "")
     # A machine's DNS name IS its identity, so the endpoint names it. A service's URL is the
