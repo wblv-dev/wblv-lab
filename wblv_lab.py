@@ -13,7 +13,7 @@ Authorities, in order of use:
 Nothing here is cached and nothing is hardcoded. The only seed is this machine's own
 resolver, which is maintained by the network rather than by us.
 """
-import os, sys, json, re, subprocess, time
+import os, sys, json, re, socket, subprocess, time
 try:
     import pexpect
 except ImportError:
@@ -78,7 +78,8 @@ REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can ans
 the network and still be useless to you.
 
 ZONE is the OPNsense interface the host answers on. LAN cannot reach ADM, so it is often
-why a host is unreachable, or legitimately is not.
+why a host is unreachable, or legitimately is not. REACH and AUTH are measured from the
+machine named in "Probing from", whose own zone is shown for exactly that reason.
 
 FAULT names what disagrees, and is blank when nothing does. 'url' -- the item's URL field
 holds no usable hostname. 'ip' -- the DHCP reservation and the live address differ, a lease
@@ -231,6 +232,15 @@ try:
             arp[e["mac"].lower()] = e
 except Exception:
     pass                                   # vendor and zone are enrichment, not load-bearing
+
+
+# Every REACH result is measured FROM HERE, and "rpi-01 / LAN / up" only means "a pinhole is
+# open" if you know the prober sits in ADM. That fact was living in a note; this reads it off
+# the same IPAM as everything else. The machine is asked what it calls itself rather than
+# being told — nothing here names a host — and it degrades to no zone if this machine has no
+# reservation or has aged out of ARP.
+PROBER = socket.gethostname().split(".")[0].lower()
+PROBER_ZONE = arp.get(inventory.get(PROBER, {}).get("mac", ""), {}).get("intf_description", "")
 
 
 # --- classify -------------------------------------------------------------------------------
@@ -463,6 +473,8 @@ def render(rows, meta):
 
     field("Vault", meta["vault"])
     field("Source", meta["ipam_source"])
+    field("Probing from", f"{meta['prober']} ({meta['prober_zone']})"
+                          if meta["prober_zone"] else meta["prober"])
     field("Runtime", f"{meta['runtime_s']}s")
     con.print()
 
@@ -550,6 +562,7 @@ if __name__ == "__main__":
     # expiry to read. It stays in --json as a diagnostic, named for what it measures, and is
     # kept off the table so it cannot be mistaken for a warning.
     meta = {"vault": VAULT, "ipam_source": opn["endpoint"],
+            "prober": PROBER, "prober_zone": PROBER_ZONE,
             "runtime_s": round(time.time() - _T0, 1), "off_directory": OFF_DIRECTORY,
             "token_file_age_days": TOKEN_FILE_AGE_DAYS}
     if "--json" in sys.argv:
