@@ -77,6 +77,10 @@ cached — every run asks again, which costs a few seconds and buys accuracy.
 REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can answer on
 the network and still be useless to you.
 
+FAULT names a field that is wrong in the VAULT ENTRY, not a problem with the host --
+'url' means the item's URL field holds no usable hostname, 'tag' that its declared kind
+and the wire disagree. Blank is healthy. The detail is in --json.
+
 This tool tells you which credential opens a host. It does not turn the key — you connect
 and run commands yourself, so the read-only limit lives in the host account."""
 
@@ -473,6 +477,11 @@ def render(rows, meta):
     t.add_column("AUTH", justify="center", no_wrap=True, min_width=4)
     t.add_column("ACCESS", style="cyan", no_wrap=True)   # connectable URI: never mangle it
     t.add_column("CREDENTIAL", style="grey50")
+    # Blank on a healthy row, so the absence of a fault is as visible as its presence. It names
+    # the field that is wrong and nothing else — the sentence explaining it lives in --json.
+    # A fault here is a defect in the VAULT ENTRY, not in the host: without it a broken URL
+    # field renders exactly like a service that legitimately has no endpoint.
+    t.add_column("FAULT", style="red", no_wrap=True)
 
     KIND = {"physical": "default", "virtual": "cyan", "service": "magenta",
             "unclassified": "yellow"}
@@ -487,7 +496,9 @@ def render(rows, meta):
                   "[green]ok[/]" if r["auth"] is True else
                   "[bold red]fail[/]" if r["auth"] is False else DASH,
                   r.get("access") or DASH,
-                  r["item"])
+                  r["item"],
+                  ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
+                                            ("tag", r.get("kind_drift"))) if bad))
 
     # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
     # column down to a single character — a stack of ellipses that looks like output while
