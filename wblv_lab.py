@@ -50,6 +50,19 @@ CREDS = {}
 # against something that did not answer", which is what stops repeated probes tripping lockouts.
 HOSTLESS_ROLES = ("1password",)
 
+# 1Password's own UI names some things for you (a Login item always carries username/password;
+# autofill leaves newUserName behind), and the same value has been written under different
+# labels over time. Aliases are ADDITIVE — the original label is kept too — so tidying an item
+# can never break the tool, and items can be migrated one at a time rather than in lockstep.
+ALIASES = {
+    "newusername": "username", "user": "username", "login": "username",
+    "pass": "password", "passwd": "password",
+    "key": "api_key", "secret": "api_secret",
+    "apikey": "api_key", "apisecret": "api_secret",
+    "clientid": "client_id", "clientsecret": "client_secret", "tenantid": "tenant_id",
+    "url": "website", "endpoint": "website",
+}
+
 HYPERVISORS = ("proxmox", "vmware", "qemu", "kvm", "xen", "microsoft corporation",
                "oracle virtualbox", "nutanix", "parallels", "red hat")
 
@@ -201,15 +214,25 @@ def _member(item):
         low = (label or "").strip().lower()
         return {low, re.sub(r"[\s\-]+", "_", low)} - {""}
 
+    # A set value never loses to an empty one. 1Password's built-in username/password sit in
+    # the fields array whether or not they are used, so an unfilled built-in would otherwise
+    # clobber a custom field of the same name purely on array order — which is luck, not design.
     c = {}
+    def put(label, value):
+        for k in _keys(label):
+            for k2 in {k, ALIASES.get(k, k)}:
+                if value or k2 not in c:
+                    c[k2] = value
     for u in (full.get("urls") or []):
-        for k in _keys(u.get("label")):
-            c[k] = u.get("href") or ""
+        put(u.get("label"), u.get("href") or "")
     for f in (full.get("fields") or []):
-        for k in _keys(f.get("label")):
-            c[k] = f.get("value") or ""
-    CREDS[name] = c
-    return {"item": title, "endpoint": endpoint, "account": user, "name": name,
+        put(f.get("label"), f.get("value") or "")
+    # Keyed by the ITEM's id, never by the resolved name. Two items can resolve to the same
+    # name — a duplicate made while migrating a format, say — and a name-keyed store lets one
+    # silently overwrite the other, so a member is probed with a different member's credentials
+    # and the result still reads "ok". Decided by thread scheduling, and invisible.
+    CREDS[item["id"]] = c
+    return {"id": item["id"], "item": title, "endpoint": endpoint, "account": user, "name": name,
             "scheme": scheme, "url_port": url_port,
             "endpoint_malformed": junk, "tags": full.get("tags") or []}
 
@@ -241,7 +264,7 @@ if not opn:
 
 # Every item's fields were already read when membership was resolved. Fetching this one
 # again cost a second `op item get` — about a second — for bytes we were already holding.
-_f = CREDS.get(opn["name"], {})
+_f = CREDS.get(opn["id"], {})
 K, S = _f.get("key", "").removeprefix("key="), _f.get("secret", "").removeprefix("secret=")
 if not (K and S):
     die(f"the OPNsense item '{opn['item']}' has no Key/Secret fields")
@@ -304,7 +327,13 @@ def classify(m):
     # A `role` field on the vault item wins over the hostname prefix. The prefix table is a
     # naming convention for machines Harry racked; it says nothing useful about a tenant. This
     # keeps onboarding a service to "add an item", with no code change.
-    role = (CREDS.get(m["name"], {}).get("role") or role).strip().lower()
+    # Two attributes, deliberately separate. PLATFORM is the API dialect and selects the auth
+    # probe — it changes entirely if OPNsense becomes pfSense. ROLE is what the thing is for and
+    # survives that swap untouched. Collapsing them made "role" mean two things at once.
+    # While items are being migrated, a lone `role` is still accepted as the platform.
+    _c = CREDS.get(m["id"], {})
+    platform = (_c.get("platform") or _c.get("role") or role).strip().lower()
+    role = (_c.get("role") if _c.get("platform") else "").strip().lower()
     # Fall back to what the URL states. ROLES still wins where it has an entry, because it
     # names the MANAGEMENT port, which is often not the port in the browser URL (DSM: 5001).
     if port is None and m.get("url_port"):
@@ -328,7 +357,7 @@ def classify(m):
 
     drift = (f"tagged {declared}, but the wire says {observed}"
              if declared and observed and declared != observed else "")
-    return {**m, **inv, "role": role, "port": port,
+    return {**m, **inv, "role": role, "platform": platform, "port": port,
             "access": (f"{proto}://{inv.get('fqdn') or m['endpoint']}:{port}"
                        if port and (inv.get('fqdn') or m['endpoint']) else ""),
             "vendor": vendor, "zone": zone,
@@ -421,9 +450,9 @@ def aruba_probe(user, host, pw):
 def auth_probe(r):
     """A REAL read-only login, using the host's own mechanism. Returns (ok|None, detail).
     None means 'cannot be tested', which is different from 'failed' and must stay different."""
-    c, host = CREDS.get(r["name"], {}), r.get("fqdn") or r["endpoint"]
+    c, host = CREDS.get(r["id"], {}), r.get("fqdn") or r["endpoint"]
     try:
-        if r["role"] == "1password":
+        if r["platform"] == "1password":
             # Deliberately ahead of the host check: this probe talks to no host. It already ran
             # as the substrate pre-check before any member was resolved, so it costs nothing to
             # report, and requiring a URL purely to satisfy the plumbing would be ceremony —
@@ -434,12 +463,12 @@ def auth_probe(r):
                     else "op whoami returned nothing")
         if not host:
             return None, "no endpoint to test"
-        if r["role"] == "opnsense":
+        if r["platform"] == "opnsense":
             k = c.get("key", "").removeprefix("key="); sec = c.get("secret", "").removeprefix("secret=")
             j = json.loads(curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}") or "{}")
             v = j.get("product_version")
             return (bool(v), f"OPNsense {v}" if v else "API rejected the credential")
-        if r["role"] == "synology":
+        if r["platform"] == "synology":
             u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
             base = f"https://{host}:5001/webapi/entry.cgi"
             out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
@@ -454,7 +483,7 @@ def auth_probe(r):
                     "--data-urlencode", "method=logout", "--data-urlencode", "session=FileStation",
                     "--data-urlencode", f"_sid={sid}"], capture_output=True)
             return (bool(sid), "DSM login ok" if sid else "DSM rejected the credential")
-        if r["role"] in ("aruba-switch", "linux"):
+        if r["platform"] in ("aruba-switch", "linux"):
             u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
             pw = (c.get("password") or c.get("confirmpassword")
                   or c.get("operator password", "")).removeprefix("password=")
@@ -462,10 +491,10 @@ def auth_probe(r):
                 return None, "no username field on the 1Password item"
             # Prove the session is really established, not merely connected: the switch echoes
             # its own name, the shell echoes a token we chose.
-            if r["role"] == "aruba-switch":
+            if r["platform"] == "aruba-switch":
                 return aruba_probe(u, host, pw)
             return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok")
-        if r["role"] == "microsoft-graph":
+        if r["platform"] == "microsoft-graph":
             # Client-credentials against the tenant. A token issued is proof the app
             # registration, the secret and the tenant are all live — which is what "is M365
             # reachable" actually means. TLS to a Microsoft endpoint only proves Microsoft is up.
@@ -481,7 +510,7 @@ def auth_probe(r):
                 return True, "Graph token issued"
             return False, (j.get("error_description", "").split(".")[0][:70]
                            or "token endpoint rejected the credential")
-        if r["role"] == "tailscale":
+        if r["platform"] == "tailscale":
             # The API key's own tailnet, via the "-" alias, so no tailnet name is written down.
             # Tailscale API keys authenticate as basic auth with an empty password.
             # An OAuth client can be scoped (devices:read); a raw API key cannot — it is
@@ -529,7 +558,7 @@ def probe(r):
     answer on the network and still be useless to you, and some hosts drop ICMP entirely."""
     host = r.get("fqdn") or r["endpoint"]
     port = r.get("port")
-    hostless = r["role"] in HOSTLESS_ROLES
+    hostless = r["platform"] in HOSTLESS_ROLES
     if not host and not hostless:
         return {**r, "reach": None, "auth": None, "auth_detail": ""}
     reach = reach_probe(host, port) if host else None
@@ -540,6 +569,15 @@ def probe(r):
 # Filtering here rather than at print time: a filtered view has no reason to probe hosts it
 # will not show, and `-s` was paying for five host probes to print one service row.
 _all = [classify(m) for m in members]
+# Two vault items resolving to one name is a data fault: whichever the eye lands on, the other
+# is a member you are not seeing. Surfaced on both rows rather than silently de-duplicated.
+_seen = {}
+for _r in _all:
+    _seen.setdefault(_r["name"], []).append(_r)
+for _n, _rs in _seen.items():
+    if len(_rs) > 1:
+        for _r in _rs:
+            _r["name_collision"] = len(_rs)
 # How much of the wire the directory accounts for. A property of the DIRECTORY, not of any
 # host, which is why it is counted here and not attached to a row. Counted before the filter,
 # because a filtered view does not make the rest of the lab stop existing.
@@ -640,7 +678,8 @@ def render(rows, meta):
                   r["item"],
                   ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
                                             ("ip", r.get("ip_drift")),
-                                            ("tag", r.get("type_drift"))) if bad))
+                                            ("tag", r.get("type_drift")),
+                                            ("dup", r.get("name_collision"))) if bad))
 
     # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
     # column down to a single character — a stack of ellipses that looks like output while
@@ -671,7 +710,8 @@ if __name__ == "__main__":
         # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
         KEEP = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
                 "access", "reach", "auth", "auth_detail", "item", "account", "endpoint",
-                "endpoint_malformed", "zone", "live_ip", "ip_drift")
+                "endpoint_malformed", "zone", "live_ip", "ip_drift", "platform",
+                "name_collision")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},
                          indent=2))
     else:
