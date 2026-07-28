@@ -156,12 +156,18 @@ def _member(item):
         return None
     full = json.loads(op("item", "get", item["id"], "--vault", VAULT, "--format", "json") or "{}")
     href = ";".join(u.get("href", "") for u in (full.get("urls") or []))
-    m = re.search(r"https?://([A-Za-z0-9.\-]+)", href)
+    m = re.search(r"(https?)://([A-Za-z0-9.\-]+)(?::(\d+))?", href)
     # A URL field holding something that is not a hostname is a data fault in the vault, not
     # something to coerce. Reported as such rather than silently parsed into nonsense — the
     # M365 item holds an expiry date and two GUIDs here, which once parsed as a host named "23".
-    endpoint = m.group(1) if (m and "." in m.group(1)) else ""
+    endpoint = m.group(2) if (m and "." in m.group(2)) else ""
     junk = bool(href) and not endpoint
+    # A service has no meaningful hostname prefix — a SaaS tenant is not identified by the
+    # first three letters of its portal's DNS name — so the URL is the only thing that states
+    # how to reach it. Read the scheme and port from it rather than inferring them.
+    scheme = m.group(1) if endpoint else ""
+    url_port = int(m.group(3)) if (endpoint and m.group(3)) else (443 if scheme == "https" else
+                                                                 80 if scheme == "http" else None)
     user = next((f.get("value", "") for f in (full.get("fields") or [])
                  if (f.get("label") or "").lower() == "username"), "")
     name = endpoint.split(".")[0].lower() if endpoint else \
@@ -169,6 +175,7 @@ def _member(item):
     CREDS[name] = {(f.get("label") or "").lower(): (f.get("value") or "")
                    for f in (full.get("fields") or [])}
     return {"item": title, "endpoint": endpoint, "account": user, "name": name,
+            "scheme": scheme, "url_port": url_port,
             "endpoint_malformed": junk, "tags": full.get("tags") or []}
 
 
@@ -259,6 +266,14 @@ def classify(m):
     signal is discarded, because each catches what the other cannot."""
     inv = inventory.get(m["name"], {})
     role, proto, port = ROLES.get(m["name"][:3], ("", "", None))
+    # A `role` field on the vault item wins over the hostname prefix. The prefix table is a
+    # naming convention for machines Harry racked; it says nothing useful about a tenant. This
+    # keeps onboarding a service to "add an item", with no code change.
+    role = (CREDS.get(m["name"], {}).get("role") or role).strip().lower()
+    # Fall back to what the URL states. ROLES still wins where it has an entry, because it
+    # names the MANAGEMENT port, which is often not the port in the browser URL (DSM: 5001).
+    if port is None and m.get("url_port"):
+        proto, port = (proto or m.get("scheme") or "https"), m["url_port"]
     _a = arp.get(inv.get("mac", ""), {})
     vendor = _a.get("manufacturer", "")
     zone = _a.get("intf_description", "")      # LAN / ADM / PLY, straight off the interface
@@ -406,6 +421,41 @@ def auth_probe(r):
             if r["role"] == "aruba-switch":
                 return aruba_probe(u, host, pw)
             return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok")
+        if r["role"] == "microsoft-graph":
+            # Client-credentials against the tenant. A token issued is proof the app
+            # registration, the secret and the tenant are all live — which is what "is M365
+            # reachable" actually means. TLS to a Microsoft endpoint only proves Microsoft is up.
+            tid, cid = c.get("tenant_id", ""), c.get("client_id", "")
+            sec = c.get("client_secret", "")
+            if not (tid and cid and sec):
+                return None, "needs tenant_id, client_id and client_secret fields on the item"
+            j = json.loads(curl(f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token",
+                                "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
+                                "-d", "scope=https://graph.microsoft.com/.default",
+                                "-d", "grant_type=client_credentials") or "{}")
+            if j.get("access_token"):
+                return True, "Graph token issued"
+            return False, (j.get("error_description", "").split(".")[0][:70]
+                           or "token endpoint rejected the credential")
+        if r["role"] == "tailscale":
+            # The API key's own tailnet, via the "-" alias, so no tailnet name is written down.
+            # Tailscale API keys authenticate as basic auth with an empty password.
+            k = c.get("api_key", "") or c.get("password", "")
+            if not k:
+                return None, "needs an api_key field on the item"
+            j = json.loads(curl("https://api.tailscale.com/api/v2/tailnet/-/devices",
+                                "-u", f"{k}:") or "{}")
+            devs = j.get("devices")
+            if devs is None:
+                return False, (j.get("message", "")[:60] or "API rejected the credential")
+            return True, f"{len(devs)} devices in the tailnet"
+        if r["role"] == "1password":
+            # This already ran as the substrate pre-check before any member was resolved, so it
+            # costs nothing to report. It is the most load-bearing dependency the tool has and
+            # was previously invisible in the output.
+            w = json.loads(op("whoami", "--format", "json") or "{}")
+            return (bool(w.get("user_uuid")),
+                    f"service account, {w.get('user_type','?').lower()}" if w else "op whoami failed")
         return None, ""
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
@@ -427,7 +477,7 @@ def probe(r):
     """REACH is a heartbeat; AUTH is proof. Kept apart because health checks lie: a host can
     answer on the network and still be useless to you, and some hosts drop ICMP entirely."""
     host = r.get("fqdn") or r["endpoint"]
-    port = ROLES.get(r["name"][:3], (None, None, None))[2]
+    port = r.get("port")
     if not host:
         return {**r, "reach": None, "auth": None, "auth_detail": ""}
     reach = reach_probe(host, port)
