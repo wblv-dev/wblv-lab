@@ -1,0 +1,27 @@
+{
+  "title": "",
+  "category": "LOGIN",
+  "urls": [
+    { "label": "website", "primary": true, "href": "" }
+  ],
+  "sections": [
+    { "id": "wblv", "label": "WBLV" }
+  ],
+  "fields": [
+    { "id": "username", "type": "STRING", "purpose": "USERNAME", "label": "username", "value": "" },
+    { "id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": "" },
+    { "id": "notesPlain", "type": "STRING", "purpose": "NOTES", "label": "notesPlain", "value": "" },
+
+    { "id": "role", "section": { "id": "wblv" }, "type": "STRING", "label": "Role", "value": "" },
+    { "id": "platform", "section": { "id": "wblv" }, "type": "STRING", "label": "Platform", "value": "" },
+
+    { "id": "api_key", "section": { "id": "wblv" }, "type": "CONCEALED", "label": "API Key", "value": "" },
+    { "id": "api_secret", "section": { "id": "wblv" }, "type": "CONCEALED", "label": "API Secret", "value": "" },
+
+    { "id": "tenant_id", "section": { "id": "wblv" }, "type": "STRING", "label": "Tenant ID", "value": "" },
+    { "id": "client_id", "section": { "id": "wblv" }, "type": "STRING", "label": "Client ID", "value": "" },
+    { "id": "client_secret", "section": { "id": "wblv" }, "type": "CONCEALED", "label": "Client Secret", "value": "" },
+
+    { "id": "expiry", "section": { "id": "wblv" }, "type": "STRING", "label": "Expiry", "value": "" }
+  ]
+}
