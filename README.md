@@ -53,6 +53,33 @@ Kept separate deliberately, because health checks lie.
 
 A host can be reachable and still be useless to you. Only `AUTH` proves otherwise.
 
+Both are measured **from the machine running the tool**, which is why its own zone is
+printed. `rpi-01 / LAN / up` only means "a pinhole is open" if you know the prober is in
+`ADM`.
+
+## ZONE and FAULT
+
+Two columns that exist to stop different things from looking alike.
+
+**ZONE** is the OPNsense interface a host answers on. Zones do not route to each other
+freely, so it is frequently *why* a host is unreachable — and without it, "blocked by
+design" and "broken" are the same output.
+
+**FAULT** is blank on a healthy row, so the absence of a fault is as visible as its
+presence. It names what disagrees and nothing else:
+
+| | |
+|---|---|
+| `url` | the vault item's URL field holds no usable hostname |
+| `ip` | the DHCP reservation and the live address differ — a lease that outlived the change that created it |
+| `tag` | the declared type and what the wire says disagree |
+
+A fault is a defect in the **vault entry or the IPAM**, never in the host. Without the
+column a broken entry rendered exactly like a service that legitimately has no endpoint.
+
+`Non-members` counts addresses OPNsense can see that no vault item claims — how much of
+the wire the directory accounts for. It is a coverage figure, not a fault.
+
 ## What it will not do
 
 - **It will not guess.** No fallback addresses, no default hosts, no assumed values. If a
