@@ -170,8 +170,13 @@ def _member(item):
                                                                  80 if scheme == "http" else None)
     user = next((f.get("value", "") for f in (full.get("fields") or [])
                  if (f.get("label") or "").lower() == "username"), "")
-    name = endpoint.split(".")[0].lower() if endpoint else \
-           title.split("/")[0].strip().lower().removeprefix("wblv-")
+    # A machine's DNS name IS its identity, so the endpoint names it. A service's URL is the
+    # vendor's domain and names nothing useful — portal.azure.com would be "portal",
+    # login.tailscale.com "login", my.1password.com "my". For those the item title is the
+    # identity, which is also how Harry has been controlling the name all along.
+    is_service = any(t.lower() == "service" for t in (full.get("tags") or []))
+    from_title = title.split("/")[0].strip().lower().removeprefix("wblv-")
+    name = from_title if (is_service or not endpoint) else endpoint.split(".")[0].lower()
     CREDS[name] = {(f.get("label") or "").lower(): (f.get("value") or "")
                    for f in (full.get("fields") or [])}
     return {"item": title, "endpoint": endpoint, "account": user, "name": name,
