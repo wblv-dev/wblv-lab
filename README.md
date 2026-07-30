@@ -10,6 +10,7 @@ wblv-lab -p         physical hosts
 wblv-lab -v         virtual hosts
 wblv-lab -s         services
 wblv-lab --mac      add the MAC column
+wblv-lab --check    swap ACCESS for what each probe actually did
 wblv-lab --json     machine-readable
 ```
 
@@ -84,6 +85,30 @@ on the heartbeat while nothing had been reached, and the credential wrongly blam
 Both are measured **from the machine running the tool**, which is why its own zone is
 printed. `rpi-01 / LAN / up` only means "a pinhole is open" if you know the prober is in
 `ADM`.
+
+## ACCESS is where you connect, not what was checked
+
+`ACCESS` answers *how do I get in*. For a host that is also what the probe hit, so the two
+coincide. For a service it is the **admin console** — `portal.azure.com`, not
+`login.microsoftonline.com` — and deliberately not what the probe talks to. Nobody logs in
+to `api.github.com`.
+
+Sitting between `ADDRESS` and `REACH`, that column reads as the thing those signals
+measured, and for a service it never was. `--check` swaps it for the mechanism:
+
+```
+wap-01   physical   down   -     no probe for omada
+365-01   service    up     ok    OIDC discovery + client-creds
+git-01   service    up     ok    GET /users/wblv-dev + /user
+ops-01   service    up     ok    op whoami
+```
+
+Same column, so the table does not grow. `--json` carries `access` and `check` together,
+since there is no width to spend there.
+
+It also makes an untested member say so: `no probe for omada` distinguishes *no probe
+written yet* from *a platform string that matches nothing* — two states that otherwise both
+render as a bare `-` in `AUTH`.
 
 ## ZONE and FAULT
 

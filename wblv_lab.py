@@ -66,6 +66,30 @@ HOSTLESS_ROLES = ("1password", "github")
 # and the fix looks like "rotate the credential", which is both wrong and destructive.
 TRANSIENT_OAUTH = ("temporarily_unavailable", "server_error", "slow_down")
 
+# What each platform's probe actually DOES. ACCESS answers "how do I get in" and is the URI
+# you connect to; for a service that is the admin console, which is deliberately NOT what the
+# probe talks to — nobody logs into api.github.com. Sitting next to REACH and AUTH, ACCESS
+# reads as the thing those columns measured, and for services it never was. `--check` swaps
+# the column so the mechanism is legible instead of implied.
+#
+# {acct} is filled from the item's own username, so the row names the identity that was used
+# rather than a generic description of the API.
+#
+# Kept to 29 characters or under, deliberately. ACCESS's widest cell is 31, so a longer CHECK
+# would make --check the wider view and push the table past the ~120 the comment above the
+# renderer warns about — the invisible cumulative growth that made the table stop fitting
+# once already. Terse but specific beats descriptive but wrapped.
+CHECKS = {
+    "opnsense":        "GET /api/core/firmware/status",
+    "synology":        "DSM login as {acct}",
+    "aruba-switch":    "ssh as {acct}, operator level",
+    "linux":           "ssh as {acct} + echo",
+    "microsoft-graph": "OIDC discovery + client-creds",
+    "tailscale":       "OAuth client -> /devices",
+    "1password":       "op whoami",
+    "github":          "GET /users/{acct} + /user",
+}
+
 # 1Password's own UI names some things for you (a Login item always carries username/password;
 # autofill leaves newUserName behind), and the same value has been written under different
 # labels over time. Aliases are ADDITIVE — the original label is kept too — so tidying an item
@@ -102,6 +126,7 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab -v           virtual hosts only
   wblv-lab -s           services only
   wblv-lab --mac        add the MAC column
+  wblv-lab --check      swap ACCESS for what each probe actually did
   wblv-lab --json       machine-readable
   wblv-lab -h           this text
 
@@ -121,6 +146,10 @@ you cannot be rejected by something you did not reach. --json says which, in rea
 ZONE is the OPNsense interface the host answers on. LAN cannot reach ADM, so it is often
 why a host is unreachable, or legitimately is not. REACH and AUTH are measured from the
 machine named in "Probing from", whose own zone is shown for exactly that reason.
+
+ACCESS is where YOU connect -- for a service that is the admin console, which is
+deliberately not what the probe talks to (nobody logs in to api.github.com). --check
+swaps the column for the mechanism that was actually used, and --json carries both.
 
 FAULT names what disagrees, and is blank when nothing does. 'url' -- the item's URL field
 holds no usable hostname. 'ip' -- the DHCP reservation and the live address differ, a lease
@@ -152,6 +181,11 @@ WANT = ({"physical"} if "-p" in sys.argv else set()) | \
 # terminal that used to fit stopped fitting without changing size. Hidden here, never dropped:
 # --json still carries it, because a machine has no width limit.
 SHOW_MAC = "--mac" in sys.argv
+
+# Swaps the ACCESS column for CHECK rather than adding one — same slot, so the table stays at
+# its width. The two answer different questions and only a machine wants both at once, which
+# is what --json is for.
+SHOW_CHECK = "--check" in sys.argv
 
 
 # --- 1Password substrate ------------------------------------------------------------------
@@ -209,9 +243,17 @@ def _member(item):
     full = json.loads(op("item", "get", item["id"], "--vault", VAULT, "--format", "json") or "{}")
     # Any slot may carry the URL: the built-in website entry, or a custom field. Reading only
     # the urls array meant a correctly-built item had no endpoint at all.
-    href = ";".join([u.get("href", "") or "" for u in (full.get("urls") or [])] +
-                    [f.get("value") or "" for f in (full.get("fields") or [])
-                     if "://" in (f.get("value") or "")])
+    slots = [u.get("href", "") or "" for u in (full.get("urls") or [])] + \
+            [f.get("value") or "" for f in (full.get("fields") or [])
+             if "://" in (f.get("value") or "")]
+    href = ";".join(slots)
+    # The URL is also kept WHOLE, not just parsed for scheme/host/port. Rebuilding it from
+    # those three threw the path away, so an item saying https://github.com/wblv-dev was
+    # reported as https://github.com:443 — a connect target less useful than the field it
+    # came from, and a port number nobody typed. A host's URI is still rebuilt from the IPAM
+    # (which is authoritative for its name); a service has no IPAM, so the vault URL as
+    # written is the only truth there is.
+    website = next((s.strip() for s in slots if "://" in s), "")
     # Any scheme, not just http(s): an SSH-managed host should be able to say so, rather than
     # being described by a web URL it does not serve. The scheme is how you reach it.
     m = re.search(r"([a-z][a-z0-9+.\-]*)://([A-Za-z0-9.\-]+)(?::(\d+))?", href, re.I)
@@ -279,7 +321,7 @@ def _member(item):
     # and the result still reads "ok". Decided by thread scheduling, and invisible.
     CREDS[item["id"]] = c
     return {"id": item["id"], "item": title, "endpoint": endpoint, "account": user, "name": name,
-            "scheme": scheme, "url_port": url_port,
+            "scheme": scheme, "url_port": url_port, "website": website,
             "endpoint_malformed": junk, "tags": full.get("tags") or []}
 
 
@@ -424,8 +466,13 @@ def classify(m):
 
     drift = (f"tagged {declared}, but the wire says {observed}"
              if declared and observed and declared != observed else "")
+    # A machine gets its URI rebuilt from the IPAM name, which is authoritative and may differ
+    # from whatever the vault item was typed with. A service has no IPAM entry, so its own URL
+    # is all there is — shown as written, path and all.
+    declared_svc = any(t.lower() == "service" for t in m["tags"])
     return {**m, **inv, "role": role, "platform": platform, "port": port,
-            "access": (f"{proto}://{inv.get('fqdn') or m['endpoint']}:{port}"
+            "access": (m.get("website") or "") if (declared_svc and not inv) else
+                      (f"{proto}://{inv.get('fqdn') or m['endpoint']}:{port}"
                        if port and (inv.get('fqdn') or m['endpoint']) else ""),
             "vendor": vendor, "zone": zone,
             "live_ip": _a.get("ip", ""), "ip_drift": ip_drift,
@@ -777,6 +824,20 @@ def tenant_reach(r):
     return None, ""
 
 
+def describe_check(r, ran):
+    """What this row's probe actually did, for --check and --json.
+
+    `ran` is whether a probe returned a verdict. It is the guard against this table and
+    auth_probe's dispatch drifting apart: a platform that gained a probe but no CHECKS entry
+    would otherwise claim "no probe" while quietly testing something, which is precisely the
+    confident-and-wrong output this tool may not produce. It says so instead."""
+    tmpl = CHECKS.get(r["platform"])
+    if tmpl:
+        return tmpl.format(acct=r.get("account") or "?")
+    return ("probe ran, undescribed" if ran
+            else f"no probe for {r['platform'] or 'unknown platform'}")
+
+
 def probe(r):
     """REACH is a heartbeat; AUTH is proof. Kept apart because health checks lie: a host can
     answer on the network and still be useless to you, and some hosts drop ICMP entirely.
@@ -801,7 +862,8 @@ def probe(r):
 
     if not host and not service:
         return {**r, "reach": None, "auth": None, "auth_detail": "",
-                "reach_basis": "untested", "access_unreachable": False}
+                "reach_basis": "untested", "access_unreachable": False,
+                "cred_fallback": False, "check": describe_check(r, False)}
 
     if service:
         reach, basis = tenant_reach(r)
@@ -842,7 +904,8 @@ def probe(r):
 
     return {**r, "reach": reach, "auth": ok, "auth_detail": detail,
             "reach_basis": basis or "untested", "access_unreachable": access_bad,
-            "cred_fallback": r["id"] in CRED_FALLBACK}
+            "cred_fallback": r["id"] in CRED_FALLBACK,
+            "check": describe_check(r, ok is not None)}
 
 
 # Filtering here rather than at print time: a filtered view has no reason to probe hosts it
@@ -933,7 +996,10 @@ def render(rows, meta):
         t.add_column("MAC", style="grey50", no_wrap=True)
     t.add_column("REACH", justify="center", no_wrap=True, min_width=5)
     t.add_column("AUTH", justify="center", no_wrap=True, min_width=4)
-    t.add_column("ACCESS", style="cyan", no_wrap=True)   # connectable URI: never mangle it
+    # ACCESS is the connectable URI and must never be mangled. CHECK takes the same slot under
+    # --check: what the probe actually did, which for a service is not the URI at all.
+    t.add_column("CHECK" if SHOW_CHECK else "ACCESS",
+                 style="magenta" if SHOW_CHECK else "cyan", no_wrap=True)
     t.add_column("CREDENTIAL", style="grey50")
     # Blank on a healthy row, so the absence of a fault is as visible as its presence. It names
     # the field that is wrong and nothing else — the sentence explaining it lives in --json.
@@ -957,7 +1023,7 @@ def render(rows, meta):
                   "[red]down[/]" if r["reach"] is False else DASH,
                   "[green]ok[/]" if r["auth"] is True else
                   "[bold red]fail[/]" if r["auth"] is False else DASH,
-                  r.get("access") or DASH,
+                  (r.get("check") if SHOW_CHECK else r.get("access")) or DASH,
                   r["item"],
                   ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
                                             ("ip", r.get("ip_drift")),
@@ -1002,7 +1068,7 @@ if __name__ == "__main__":
         # consumer branching on the set would otherwise default an unmeasured member into
         # whichever bucket it happened to fall through to.
         KEEP = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
-                "access", "reach", "reach_basis", "auth", "auth_detail", "item", "account",
+                "access", "check", "reach", "reach_basis", "auth", "auth_detail", "item", "account",
                 "endpoint", "endpoint_malformed", "access_unreachable", "cred_fallback",
                 "zone", "live_ip", "ip_drift", "platform", "name_collision")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},

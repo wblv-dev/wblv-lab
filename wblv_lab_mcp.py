@@ -81,6 +81,11 @@ def wblv_lab(type: str = "") -> str:
     A probe reports null (untested) when the transfer never completed and false (failed) only
     when the far end actually answered no. Do not read a null AUTH as a bad credential.
 
+    `access` is where a HUMAN connects — for a service that is the admin console, not the API
+    the probe used. `check` names what was actually done to produce REACH and AUTH ("op
+    whoami", "GET /users/wblv-dev + /user", "no probe for omada"). Quote `access` when telling
+    someone how to reach a member, and `check` when explaining what a green row is based on.
+
     Args:
         type: optional filter — "physical", "virtual" or "service". Empty returns everything.
     """
