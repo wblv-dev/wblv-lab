@@ -9,6 +9,7 @@ wblv-lab            every host and service
 wblv-lab -p         physical hosts
 wblv-lab -v         virtual hosts
 wblv-lab -s         services
+wblv-lab --mac      add the MAC column
 wblv-lab --json     machine-readable
 ```
 
@@ -47,11 +48,38 @@ Two things fall out of that rather than being designed in:
 
 Kept separate deliberately, because health checks lie.
 
-- **REACH** — a heartbeat: is it answering on the network. Can be a false negative; some
-  hosts drop ICMP entirely.
+- **REACH** — a heartbeat: is it answering. Can be a false negative; some hosts drop ICMP
+  entirely.
 - **AUTH** — a real read-only login actually succeeded. This is the signal to trust.
 
 A host can be reachable and still be useless to you. Only `AUTH` proves otherwise.
+
+### What REACH measures depends on what the member is
+
+A host has an address, so the heartbeat is that address answering. A service has no address
+in this lab — only a vendor's URL — and a TCP handshake with `portal.azure.com` proves
+Microsoft is running. That is true on every day this tool will ever run, and says nothing
+about whether *your* tenant exists. A green light wired to the wrong thing is worse than no
+light at all.
+
+So `REACH` is measured three ways, and `--json` reports which one in `reach_basis`:
+
+| basis | meaning |
+|---|---|
+| `endpoint` | the member's own address answered (`nc` / `ping`, raced) |
+| `tenant` | a tenant-scoped call answered — proof *this* tenant is there. M365 uses Entra's per-tenant OIDC discovery document, which needs no credential and returns `400 AADSTS90002` for a tenant that does not exist |
+| `derived` | the auth probe reached it, and nothing weaker could. You cannot be rejected by something you did not reach, so a *rejected* credential proves reach as well as an accepted one |
+| `untested` | nothing could be measured — no probe exists, or every probe failed in transit. `REACH` is `-`, never `up` |
+
+`derived` is not a weaker answer, it is a narrower one: a Tailscale tailnet is deliberately
+not publicly discoverable, and neither is a 1Password account, so there is nothing to
+measure there without authenticating. The two signals then carry one measurement between
+them — which `reach_basis` makes visible rather than leaving implied.
+
+Deriving reach only works because a probe now reports **untested** (`None`) when the
+transfer never completed, and **failed** (`False`) only when the far end actually said no.
+Conflating those meant an outage rendered as `REACH up / AUTH fail` — every service green
+on the heartbeat while nothing had been reached, and the credential wrongly blamed.
 
 Both are measured **from the machine running the tool**, which is why its own zone is
 printed. `rpi-01 / LAN / up` only means "a pinhole is open" if you know the prober is in

@@ -71,6 +71,16 @@ def wblv_lab(type: str = "") -> str:
     a false negative, because some hosts drop ICMP entirely. AUTH means a read-only login
     genuinely succeeded. Trust AUTH.
 
+    For a host, REACH is its address answering. A service has no address, so REACH is scoped to
+    the tenant — proof that YOUR tenant answered, never that the vendor's front door is up.
+    Where no such call exists without a credential, REACH is derived from the auth probe, since
+    a credential cannot be rejected by something that was not reached. reach_basis says which
+    measurement produced it: "endpoint", "tenant", "derived", or "untested" when nothing could
+    be measured at all — in which case REACH is null, never true.
+
+    A probe reports null (untested) when the transfer never completed and false (failed) only
+    when the far end actually answered no. Do not read a null AUTH as a bad credential.
+
     Args:
         type: optional filter — "physical", "virtual" or "service". Empty returns everything.
     """

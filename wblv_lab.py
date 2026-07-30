@@ -43,12 +43,28 @@ ROLES = {                     # prefix -> (role, protocol, port)
 # built from an explicit whitelist below; a secret must never be one accidental print away.
 CREDS = {}
 
+# Item ids whose probe authenticated with a credential this MACHINE holds rather than the one
+# the vault item carries. The row's whole claim is "this item opens it", so a green AUTH that
+# actually proves `gh`'s local token works is the row asserting something untested. Surfaced
+# as a fault, because the qualifier in auth_detail never reaches the table.
+CRED_FALLBACK = set()
+
 # Vendor strings OPNsense resolves from the OUI. Matched on the NAME the router reports, not
 # on a local OUI table — the lookup is the device's, we only classify the answer.
 # Roles whose auth probe talks to no host, so neither an endpoint nor a successful REACH is a
 # precondition for testing them. Kept explicit: the default stays "do not attempt a login
 # against something that did not answer", which is what stops repeated probes tripping lockouts.
-HOSTLESS_ROLES = ("1password",)
+# github belongs here for the same reason: its probe hardcodes api.github.com, so an item
+# carrying only a token — or one whose URL slot holds labelled data rather than a link, the
+# shape the M365 item already had — needs no endpoint to be testable. Without this it was
+# dropped before any probe ran and read as permanently untested.
+HOSTLESS_ROLES = ("1password", "github")
+
+# OAuth's own names for "this is us, not you" (RFC 6749 §5.2 plus Azure's spelling). A token
+# endpoint that answers with one of these has NOT rejected the credential, so the probe must
+# report untested rather than failed — otherwise a provider-side wobble reads as a dead secret
+# and the fix looks like "rotate the credential", which is both wrong and destructive.
+TRANSIENT_OAUTH = ("temporarily_unavailable", "server_error", "slow_down")
 
 # 1Password's own UI names some things for you (a Login item always carries username/password;
 # autofill leaves newUserName behind), and the same value has been written under different
@@ -85,6 +101,7 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab -p           physical hosts only
   wblv-lab -v           virtual hosts only
   wblv-lab -s           services only
+  wblv-lab --mac        add the MAC column
   wblv-lab --json       machine-readable
   wblv-lab -h           this text
 
@@ -95,6 +112,12 @@ cached — every run asks again, which costs a few seconds and buys accuracy.
 REACH is a heartbeat. AUTH is a real read-only login. Trust AUTH: a host can answer on
 the network and still be useless to you.
 
+For a HOST, reach is its address answering. For a SERVICE there is no address, so reach is
+scoped to the tenant -- a call that proves YOUR tenant is there, not that the vendor is up.
+Where no such call exists without a credential, reach comes from the auth probe, because
+you cannot be rejected by something you did not reach. --json says which, in reach_basis:
+'endpoint', 'tenant', 'derived', or 'untested' when nothing could be measured at all.
+
 ZONE is the OPNsense interface the host answers on. LAN cannot reach ADM, so it is often
 why a host is unreachable, or legitimately is not. REACH and AUTH are measured from the
 machine named in "Probing from", whose own zone is shown for exactly that reason.
@@ -102,6 +125,9 @@ machine named in "Probing from", whose own zone is shown for exactly that reason
 FAULT names what disagrees, and is blank when nothing does. 'url' -- the item's URL field
 holds no usable hostname. 'ip' -- the DHCP reservation and the live address differ, a lease
 that outlived the change which created it. 'tag' -- the declared type and the wire disagree.
+'access' -- the member answered, but the URI in the ACCESS column did not. 'cred' -- AUTH
+passed on a credential this machine holds, not the one the item carries, so the item is
+untested. 'dup' -- two items resolve to one name, so one of them is a member you cannot see.
 
 Non-members counts addresses OPNsense can see that no vault item claims. It says how much
 of the wire this directory accounts for; it is not a fault.
@@ -118,6 +144,14 @@ if {"-h", "--help", "help"} & set(sys.argv[1:]):
 WANT = ({"physical"} if "-p" in sys.argv else set()) | \
        ({"virtual"} if "-v" in sys.argv else set()) | \
        ({"service"} if "-s" in sys.argv else set())
+
+# MAC is the widest column that answers a question nobody asks at a glance: it identifies a
+# NIC, where every other column answers "is the lab healthy and how do I get in". It cost 20
+# columns and pushed the table past the ~120 the comment below the table warns about — three
+# additions (FAULT, ZONE, services-as-members) took the natural width from 119 to 138, so a
+# terminal that used to fit stopped fitting without changing size. Hidden here, never dropped:
+# --json still carries it, because a machine has no width limit.
+SHOW_MAC = "--mac" in sys.argv
 
 
 # --- 1Password substrate ------------------------------------------------------------------
@@ -199,8 +233,13 @@ def _member(item):
     DEFAULT_PORT = {"https": 443, "http": 80, "ssh": 22}
     url_port = (int(m.group(3)) if (endpoint and m.group(3))
                 else DEFAULT_PORT.get(scheme) if endpoint else None)
-    user = next((f.get("value", "") for f in (full.get("fields") or [])
-                 if (f.get("label") or "").lower() == "username"), "")
+    # A set value never loses to an empty one — the same rule the credential map applies below.
+    # 1Password's built-in username field exists whether or not it is filled, so an item that
+    # carries its account in a named section would show a blank ACCOUNT purely because the empty
+    # built-in comes first in the array. That is luck, not design, and it made the one migrated
+    # item look accountless next to the seven that had not been touched yet.
+    user = next((f.get("value") for f in (full.get("fields") or [])
+                 if (f.get("label") or "").lower() == "username" and f.get("value")), "")
     # A machine's DNS name IS its identity, so the endpoint names it. A service's URL is the
     # vendor's domain and names nothing useful — portal.azure.com would be "portal",
     # login.tailscale.com "login", my.1password.com "my". For those the item title is the
@@ -256,12 +295,24 @@ if not members:
 
 
 # --- detail: OPNsense is the IPAM ----------------------------------------------------------
-def curl(url, *extra, t=10, verify=True):
+def curl(url, *extra, t=10, verify=True, stdin=None):
     """TLS is verified by default. Verification requires addressing the host by NAME — a
-    certificate can never match a bare IP — which is why this tool has no addresses in it."""
+    certificate can never match a bare IP — which is why this tool has no addresses in it.
+
+    Returns (REACHED, body). REACHED is curl's own exit status: did the transfer complete at
+    all. Discarding it was a real defect — an unreachable host and a host that answered
+    "no" both arrive as an empty string, so every caller that parsed the body alone reported
+    a network outage as a rejected credential, and the reach derived from that as "up".
+    Callers MUST branch on REACHED before reading the body: no answer is None (untested),
+    never False (failed). That distinction is the one this whole tool is built on.
+
+    Note an HTTP error is a COMPLETED transfer — 400 or 401 means the far end answered, and
+    curl exits 0. Only a transport failure (DNS, refused, TLS, timeout) exits non-zero."""
     flags = ["-s"] if verify else ["-sk"]
-    return subprocess.run(["curl", *flags, "--max-time", str(t), *extra, url],
-                          capture_output=True, text=True).stdout
+    r = subprocess.run(["curl", *flags, "--max-time", str(t), *extra, url],
+                       capture_output=True, text=True,
+                       input=stdin, timeout=t + 5)
+    return r.returncode == 0, r.stdout
 
 
 opn = next((m for m in members if m["name"].startswith("opn")), None)
@@ -284,7 +335,7 @@ with ThreadPoolExecutor(max_workers=2) as ex:
     _dns = ex.submit(curl, f"{API}/dnsmasq/settings/get", "-u", f"{K}:{S}")
     _arp = ex.submit(curl, f"{API}/diagnostics/interface/get_arp", "-u", f"{K}:{S}")
 try:
-    dj = json.loads(_dns.result() or "{}")
+    dj = json.loads(_dns.result()[1] or "{}")
     for h in (dj.get("dnsmasq", {}).get("hosts", {}) or {}).values():
         nm = h.get("host", "")
         if nm:
@@ -308,7 +359,7 @@ try:
     # Keyed by MAC, not by the reserved IP. A host that is live on a different address than
     # its reservation would silently fall out of an IP-keyed lookup, and the missing vendor
     # would read as "aged out of ARP" — a data drift disguised as a stale cache entry.
-    for e in json.loads(_arp.result() or "[]"):
+    for e in json.loads(_arp.result()[1] or "[]"):
         if e.get("mac"):
             arp[e["mac"].lower()] = e
 except Exception:
@@ -482,7 +533,10 @@ def auth_probe(r):
         if r["platform"] == "opnsense":
             k = (c.get("api_key") or c.get("key") or "").removeprefix("key=")
             sec = (c.get("api_secret") or c.get("secret") or "").removeprefix("secret=")
-            j = json.loads(curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}") or "{}")
+            got, body = curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}")
+            if not got:
+                return None, "no answer from the API"
+            j = json.loads(body or "{}")
             v = j.get("product_version")
             return (bool(v), f"OPNsense {v}" if v else "API rejected the credential")
         if r["platform"] == "synology":
@@ -519,12 +573,21 @@ def auth_probe(r):
             sec = c.get("client_secret", "")
             if not (tid and cid and sec):
                 return None, "needs tenant_id, client_id and client_secret fields on the item"
-            j = json.loads(curl(f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token",
-                                "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
-                                "-d", "scope=https://graph.microsoft.com/.default",
-                                "-d", "grant_type=client_credentials") or "{}")
+            got, body = curl(f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token",
+                             "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
+                             "-d", "scope=https://graph.microsoft.com/.default",
+                             "-d", "grant_type=client_credentials")
+            if not got:
+                return None, "no answer from the token endpoint"
+            j = json.loads(body or "{}")
             if j.get("access_token"):
                 return True, "Graph token issued"
+            # An answer that is not a token is not automatically a rejection. OAuth names its
+            # server-side transients, and reading one as "your credential is bad" sends Harry
+            # to rotate a working secret during someone else's outage — the same mistake as
+            # deriving reach from a transport failure, one layer up.
+            if (j.get("error") or "") in TRANSIENT_OAUTH:
+                return None, f"token endpoint unavailable ({j['error']})"
             return False, (j.get("error_description", "").split(".")[0][:70]
                            or "token endpoint rejected the credential")
         if r["platform"] == "tailscale":
@@ -536,23 +599,96 @@ def auth_probe(r):
             cid, sec = c.get("client_id", ""), c.get("client_secret", "")
             k, how = c.get("api_key", "") or c.get("password", ""), "API key (full-access)"
             if cid and sec:
-                tok = json.loads(curl("https://api.tailscale.com/api/v2/oauth/token",
-                                      "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
-                                      "-d", "grant_type=client_credentials") or "{}")
+                got, body = curl("https://api.tailscale.com/api/v2/oauth/token",
+                                 "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
+                                 "-d", "grant_type=client_credentials")
+                if not got:
+                    return None, "no answer from the OAuth endpoint"
+                tok = json.loads(body or "{}")
                 k, how = tok.get("access_token", ""), "OAuth client"
                 if not k:
+                    if (tok.get("error") or "") in TRANSIENT_OAUTH:
+                        return None, f"OAuth endpoint unavailable ({tok['error']})"
                     return False, "OAuth client rejected"
                 auth = ["-H", f"Authorization: Bearer {k}"]
             elif k:
                 auth = ["-u", f"{k}:"]
             else:
                 return None, "needs client_id + client_secret (scoped OAuth) or api_key"
-            j = json.loads(curl("https://api.tailscale.com/api/v2/tailnet/-/devices",
-                                *auth) or "{}")
+            got, body = curl("https://api.tailscale.com/api/v2/tailnet/-/devices", *auth)
+            if not got:
+                return None, "no answer from the API"
+            j = json.loads(body or "{}")
             devs = j.get("devices")
             if devs is None:
                 return False, (j.get("message", "")[:60] or "API rejected the credential")
             return True, f"{len(devs)} devices, via {how}"
+        if r["platform"] == "github":
+            # A PAT authenticates as a bearer token, and /user is the cheapest READ that proves
+            # one is live: it mutates nothing and costs one of 5,000 hourly calls. The item's
+            # Website stays the human URL, as it does for the tenant and the tailnet — the API
+            # host is the probe's business, not something to make Harry type.
+            # The vault first, then gh's own store. `gh` already holds a working token and is
+            # the tool that owns it, so copying it into 1Password would create a second copy
+            # that goes stale the moment gh re-authenticates — the same reason ops-01 carries
+            # no secret and is probed via the local op token. Which source was used is REPORTED
+            # rather than silently resolved: a probe that quietly falls back to a local
+            # credential would show green while the vault entry it claims to test is wrong.
+            k, src = (c.get("api_key") or c.get("password") or ""), "vault"
+            if not k:
+                # Bounded like every other probe. Unbounded, a gh that blocks on a Keychain
+                # prompt with no human present never returns, and because probe() runs in a
+                # thread pool the WHOLE directory hangs — the session hook dies at 60s with no
+                # lab state, the MCP server at 120s. One row's credential is not worth that.
+                try:
+                    k, src = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                                            text=True, timeout=10).stdout.strip(), "gh"
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    k, src = "", "gh"
+                if k:
+                    CRED_FALLBACK.add(r["id"])
+            if not k:
+                return None, "no api_key on the item, and gh holds no token"
+            # Headers as well as body. GitHub returns the token's own grants in x-oauth-scopes,
+            # so the probe can report the AUTHORITY it is carrying rather than merely that it
+            # works — a credential wider than its job is a finding, and this surfaces it every
+            # session instead of during an incident. Fine-grained PATs send no such header,
+            # which is itself the answer.
+            #
+            # Headers go to stderr and the body to stdout, so the two are separated by the OS
+            # rather than by parsing. `-D -` interleaves them on one stream with no reliable
+            # blank line between: curl emits CRLF per header but no CRLFCRLF terminator, so
+            # splitting on it silently yields an empty body and reads as a rejected token.
+            #
+            # The token goes in on STDIN, never in argv. ssh_probe's docstring already states
+            # the invariant — a secret passed as an argument is readable by any local process
+            # from `ps`, and lands verbatim in any sample or spindump swept into a diagnostic
+            # bundle. The KEEP whitelist guards the output path; argv was leaking out the side.
+            r_ = subprocess.run(["curl", "-s", "-D", "/dev/stderr", "--max-time", "10",
+                                 "--config", "-",
+                                 "-H", "Accept: application/vnd.github+json",
+                                 "https://api.github.com/user"],
+                                input=f'header = "Authorization: Bearer {k}"\n',
+                                capture_output=True, text=True, timeout=15)
+            if r_.returncode != 0:
+                return None, "no answer from the API"
+            head = r_.stderr
+            login = (json.loads(r_.stdout or "{}") or {}).get("login")
+            if not login:
+                return False, "API rejected the token"
+            # A header that is PRESENT but empty is a classic PAT with no scopes ticked, which
+            # is not the same thing as an absent header (a fine-grained PAT). Collapsing them
+            # reported a legacy full-account token as the modern narrowly-scoped kind — the
+            # exact inversion this branch exists to prevent. Split on the comma and strip,
+            # since the separator is ", " only by convention.
+            scoped = next((l.split(":", 1)[1].strip() for l in head.splitlines()
+                           if l.lower().startswith("x-oauth-scopes:")), None)
+            grants = [s.strip() for s in (scoped or "").split(",") if s.strip()]
+            admin = [s for s in grants if s.startswith("admin:")]
+            kind = (f"{len(grants)} scopes" + (f" incl. {len(admin)} admin" if admin else "")
+                    if grants else "classic, no scopes" if scoped is not None
+                    else "fine-grained")
+            return True, f"{login}, {kind}, via {src}"
         return None, ""
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
@@ -570,17 +706,143 @@ def reach_probe(host, port):
         return any(f.result() for f in futures)
 
 
+def tenant_reach(r):
+    """REACH for a service has to mean "I can see THIS tenant", not "the vendor is up".
+
+    A TCP handshake with portal.azure.com proves Microsoft is running — true on every day this
+    tool will ever be run, and silent on whether the tenant exists. That is a green light
+    wired to the wrong thing, which is worse than no light at all.
+
+    Where the vendor publishes a tenant-scoped endpoint needing no credential, that is the real
+    signal. Where none does, there is nothing to measure without authenticating: a Tailscale
+    tailnet is deliberately not publicly discoverable, and neither is a 1Password account. For
+    those, reach is derived from the auth probe in probe() rather than faked from a front door.
+
+    Returns (True|False|None, basis). None means "no unauthenticated tenant probe exists here",
+    which is a different statement from False, and must stay different."""
+    c = CREDS.get(r["id"], {})
+    if r["platform"] == "microsoft-graph":
+        tid = c.get("tenant_id", "")
+        if not tid:
+            return None, ""
+        # Entra publishes per-tenant OIDC discovery with no credential. A live tenant answers
+        # 200 and echoes its own id in `issuer`; one that does not exist answers 400
+        # AADSTS90002. The id is CHECKED, not merely the status — a 200 describing somebody
+        # else's tenant would be a pass proving nothing about ours.
+        got, body = curl(f"https://login.microsoftonline.com/{tid}"
+                         "/v2.0/.well-known/openid-configuration")
+        if not got:
+            return None, ""        # never reached it: says nothing about the tenant
+        try:
+            j = json.loads(body or "{}")
+        except ValueError:
+            # A captive portal, a proxy error page or an HTML 5xx is an answer we cannot read,
+            # which is not a verdict. Unguarded this raised inside a thread pool and took the
+            # WHOLE directory down with a traceback — every healthy host with it.
+            return None, ""
+        iss = j.get("issuer") or ""
+        if iss:
+            return (tid.lower() in iss.lower()), "tenant"
+        # ONLY the specific tenant-not-found answer counts as absent. Anything else Entra says
+        # — throttling, temporarily_unavailable, an interstitial — must stay None, because a
+        # False here also suppresses the auth probe, and that is the signal actually trusted.
+        # Reporting a live tenant as gone while silently skipping the login is the worst of
+        # both: it looks like a deleted tenant and proves nothing.
+        err = f"{j.get('error') or ''} {j.get('error_description') or ''}".lower()
+        if "invalid_tenant" in err or "aadsts90002" in err:
+            return False, "tenant"
+        return None, ""
+    if r["platform"] == "github":
+        # GitHub publishes an account unauthenticated, and the account IS the tenant here.
+        # Same shape as the Entra discovery document: it needs no credential, it names the
+        # thing we care about rather than the vendor, and it discriminates — a real account
+        # answers 200 echoing its own login, one that does not exist answers 404. That takes
+        # this row off "derived", so REACH stops depending on the PAT being valid.
+        who = c.get("username", "")
+        if not who:
+            return None, ""
+        got, body = curl(f"https://api.github.com/users/{who}")
+        if not got:
+            return None, ""
+        try:
+            j = json.loads(body or "{}")
+        except ValueError:
+            return None, ""
+        login = j.get("login") or ""
+        if login:
+            # Compared, not merely present — a 200 describing a different account would
+            # otherwise pass while proving nothing about ours.
+            return (login.lower() == who.lower()), "tenant"
+        return (False, "tenant") if j.get("message") == "Not Found" else (None, "")
+    return None, ""
+
+
 def probe(r):
     """REACH is a heartbeat; AUTH is proof. Kept apart because health checks lie: a host can
-    answer on the network and still be useless to you, and some hosts drop ICMP entirely."""
+    answer on the network and still be useless to you, and some hosts drop ICMP entirely.
+
+    Hosts and services are measured differently because "is it there" means different things.
+    A host has an address, so the heartbeat is the address answering. A service has no address
+    in this lab — only a vendor's URL — so the heartbeat has to be scoped to the tenant, or
+    else derived from the one call that does reach it. The vendor front door is never the
+    answer for a service, which is why reach_probe() is not in that path at all."""
     host = r.get("fqdn") or r["endpoint"]
     port = r.get("port")
     hostless = r["platform"] in HOSTLESS_ROLES
-    if not host and not hostless:
-        return {**r, "reach": None, "auth": None, "auth_detail": ""}
-    reach = reach_probe(host, port) if host else None
-    ok, detail = auth_probe(r) if (reach or hostless) else (None, "")
-    return {**r, "reach": reach, "auth": ok, "auth_detail": detail}
+    # A DECLARED service only. classify() also INFERS "service" from the wire, for any member
+    # with no IPAM entry — and an untagged host that has fallen out of Dnsmasq, or whose item
+    # hostname stopped matching its reservation, looks exactly like that. Routing it here
+    # would drop the reach gate and fire repeated password logins at a box that never
+    # answered, which is the DSM auto-block the synology branch warns about. The tag is Harry
+    # stating what a thing is; the wire is a guess, and a guess must never change how a member
+    # is measured. Hostless members take this path whatever they are tagged, because there is
+    # no address to measure either way.
+    service = hostless or (r["type"] == "service" and r["source"] == "tag")
+
+    if not host and not service:
+        return {**r, "reach": None, "auth": None, "auth_detail": "",
+                "reach_basis": "untested", "access_unreachable": False}
+
+    if service:
+        reach, basis = tenant_reach(r)
+        # A tenant proven absent is not a login to attempt — the same restraint that stops a
+        # dead host being probed, and the reason auth stays "-" rather than "fail".
+        ok, detail = auth_probe(r) if reach is not False else (None, "")
+        # A completed auth attempt IS a reach test: you cannot be rejected by something you
+        # did not reach. But that only holds for a verdict the far end actually gave us —
+        # which is why every probe now returns None, not False, when the transfer never
+        # completed. Deriving from False was reporting a total outage as REACH up.
+        if reach is None and ok is not None:
+            reach, basis = True, "derived"
+        # Still nothing, and NOTHING WAS ATTEMPTED: fall back to the endpoint so a member
+        # onboarded the way the design intends — vault item first, probe later — reports a
+        # measured heartbeat rather than a row of dashes indistinguishable from a broken
+        # vault entry.
+        #
+        # The `not detail` is load-bearing, not a tidy-up. Every probe that RAN and failed to
+        # reach says so ("no answer from the API"); only the fallthrough for a platform with
+        # no probe written returns None with nothing to say. Falling back on the noisy case
+        # too would put the vendor's front door back into REACH by the side door — an outage
+        # would show the tenant as up because portal.azure.com still accepts TCP, which is
+        # the exact green-light-wired-to-the-wrong-thing this rework existed to remove.
+        if reach is None and host and ok is None and not detail:
+            reach, basis = reach_probe(host, port), "endpoint"
+    else:
+        reach = reach_probe(host, port) if host else None
+        basis = "endpoint" if host else "untested"
+        ok, detail = auth_probe(r) if reach else (None, "")
+
+    # The ACCESS column is the one thing this tool exists to hand you, and once services
+    # stopped being measured by their own URL nothing checked it at all: a mistyped vendor
+    # hostname is still syntactically valid, so `url` never fires, and the row went fully
+    # green while the URI in it was dead. Checked separately and reported as a FAULT, so it
+    # cannot leak back into REACH and start meaning "the vendor is up" again.
+    access_bad = bool(service and host and reach is True and basis != "endpoint"
+                      and not reach_probe(host, port))
+
+    return {**r, "reach": reach, "auth": ok, "auth_detail": detail,
+            "reach_basis": basis or "untested", "access_unreachable": access_bad,
+            "cred_fallback": r["id"] in CRED_FALLBACK}
 
 
 # Filtering here rather than at print time: a filtered view has no reason to probe hosts it
@@ -667,7 +929,8 @@ def render(rows, meta):
     # legitimately is not. LAN cannot reach ADM, so an unreachable PLY host is the firewall
     # working, not a fault — and without this the two are indistinguishable in the output.
     t.add_column("ZONE", no_wrap=True)
-    t.add_column("MAC", style="grey50", no_wrap=True)
+    if SHOW_MAC:
+        t.add_column("MAC", style="grey50", no_wrap=True)
     t.add_column("REACH", justify="center", no_wrap=True, min_width=5)
     t.add_column("AUTH", justify="center", no_wrap=True, min_width=4)
     t.add_column("ACCESS", style="cyan", no_wrap=True)   # connectable URI: never mangle it
@@ -682,12 +945,15 @@ def render(rows, meta):
             "unclassified": "yellow"}
     DASH = "[grey35]-[/]"
     for r in rows:
-        t.add_row(r["name"],
-                  f"[{TYPE.get(r['type'], 'yellow')}]{r['type']}[/]",
-                  r.get("ip") or DASH,
-                  r.get("zone") or DASH,
-                  r.get("mac") or DASH,
-                  "[green]up[/]" if r["reach"] is True else
+        # Built as a list, not positional arguments, so the MAC cell can be left out entirely
+        # rather than added as a blank one — a blank column still costs its header width.
+        cells = [r["name"],
+                 f"[{TYPE.get(r['type'], 'yellow')}]{r['type']}[/]",
+                 r.get("ip") or DASH,
+                 r.get("zone") or DASH]
+        if SHOW_MAC:
+            cells.append(r.get("mac") or DASH)
+        cells += ["[green]up[/]" if r["reach"] is True else
                   "[red]down[/]" if r["reach"] is False else DASH,
                   "[green]ok[/]" if r["auth"] is True else
                   "[bold red]fail[/]" if r["auth"] is False else DASH,
@@ -696,7 +962,10 @@ def render(rows, meta):
                   ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
                                             ("ip", r.get("ip_drift")),
                                             ("tag", r.get("type_drift")),
-                                            ("dup", r.get("name_collision"))) if bad))
+                                            ("access", r.get("access_unreachable")),
+                                            ("cred", r.get("cred_fallback")),
+                                            ("dup", r.get("name_collision"))) if bad)]
+        t.add_row(*cells)
 
     # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
     # column down to a single character — a stack of ellipses that looks like output while
@@ -725,10 +994,17 @@ if __name__ == "__main__":
             "token_file_age_days": TOKEN_FILE_AGE_DAYS}
     if "--json" in sys.argv:
         # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
+        # reach_basis says WHICH measurement produced REACH — "endpoint" (the address
+        # answered), "tenant" (a tenant-scoped call answered), "derived" (the auth probe
+        # reached it, and nothing weaker could) or "untested" (nothing could be measured).
+        # Two rows both reading reach:true are not making the same claim, and a machine
+        # consuming this should be able to tell. It is never absent and never empty: a
+        # consumer branching on the set would otherwise default an unmeasured member into
+        # whichever bucket it happened to fall through to.
         KEEP = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
-                "access", "reach", "auth", "auth_detail", "item", "account", "endpoint",
-                "endpoint_malformed", "zone", "live_ip", "ip_drift", "platform",
-                "name_collision")
+                "access", "reach", "reach_basis", "auth", "auth_detail", "item", "account",
+                "endpoint", "endpoint_malformed", "access_unreachable", "cred_fallback",
+                "zone", "live_ip", "ip_drift", "platform", "name_collision")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},
                          indent=2))
     else:
