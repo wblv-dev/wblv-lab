@@ -13,7 +13,7 @@ Authorities, in order of use:
 Nothing here is cached and nothing is hardcoded. The only seed is this machine's own
 resolver, which is maintained by the network rather than by us.
 """
-import os, sys, json, re, socket, subprocess, time
+import os, sys, json, re, socket, subprocess, threading, time
 try:
     import pexpect
 except ImportError:
@@ -66,29 +66,35 @@ HOSTLESS_ROLES = ("1password", "github")
 # and the fix looks like "rotate the credential", which is both wrong and destructive.
 TRANSIENT_OAUTH = ("temporarily_unavailable", "server_error", "slow_down")
 
-# What each platform's probe actually DOES. ACCESS answers "how do I get in" and is the URI
-# you connect to; for a service that is the admin console, which is deliberately NOT what the
-# probe talks to — nobody logs into api.github.com. Sitting next to REACH and AUTH, ACCESS
-# reads as the thing those columns measured, and for services it never was. `--check` swaps
-# the column so the mechanism is legible instead of implied.
+# What each probe actually DID. ACCESS answers "how do I get in" and is the URI you connect
+# to; for a service that is the admin console, which is deliberately NOT what the probe talks
+# to — nobody logs in to api.github.com. Sitting next to REACH and AUTH, ACCESS reads as the
+# thing those columns measured, and for a service it never was. `--check` swaps the column so
+# the mechanism is legible instead of implied.
 #
-# {acct} is filled from the item's own username, so the row names the identity that was used
-# rather than a generic description of the API.
+# RECORDED, not described. A hand-written table of what each probe does is a fact that goes
+# stale silently: add an omada probe and it says "no probe"; 1Password changes its verb and
+# it still claims the old one. Same failure as writing a device's address into a note.
 #
-# Kept to 29 characters or under, deliberately. ACCESS's widest cell is 31, so a longer CHECK
-# would make --check the wider view and push the table past the ~120 the comment above the
-# renderer warns about — the invisible cumulative growth that made the table stop fitting
-# once already. Terse but specific beats descriptive but wrapped.
-CHECKS = {
-    "opnsense":        "GET /api/core/firmware/status",
-    "synology":        "DSM login as {acct}",
-    "aruba-switch":    "ssh as {acct}, operator level",
-    "linux":           "ssh as {acct} + echo",
-    "microsoft-graph": "OIDC discovery + client-creds",
-    "tailscale":       "OAuth client -> /devices",
-    "1password":       "op whoami",
-    "github":          "GET /users/{acct} + /user",
-}
+# So the probe helpers append what they ACTUALLY did, keyed by the member being probed, and
+# CHECK is read back from that. A member with nothing recorded gets "" -> "-", which is the
+# truth: nothing was checked. Adding a probe makes its row describe itself with no second
+# place to update.
+#
+# Only the operation is recorded, never its credentials — the URL without its query string,
+# the command without its arguments. Same rule as the output whitelist.
+PROBE_OPS = {}
+_CUR = threading.local()
+
+
+def note_op(text):
+    """Record one operation against the member currently being probed. A no-op outside a
+    probe (the IPAM read runs before any member exists), so it cannot misattribute."""
+    mid = getattr(_CUR, "id", None)
+    if mid and text:
+        PROBE_OPS.setdefault(mid, [])
+        if text not in PROBE_OPS[mid]:      # a retry is the same check, not a second one
+            PROBE_OPS[mid].append(text)
 
 # 1Password's own UI names some things for you (a Login item always carries username/password;
 # autofill leaves newUserName behind), and the same value has been written under different
@@ -204,6 +210,8 @@ TOKEN_FILE_AGE_DAYS = round((time.time() - os.path.getmtime(TOKEN_PATH)) / 86400
 
 def op(*args, timeout=15):
     """Run `op`, returning stdout. Empty on failure so callers degrade rather than hang."""
+    # Subcommand only — `op item get <id>` would record an id, and the verb is the point.
+    note_op("op " + " ".join(a for a in args[:2] if not a.startswith("-")))
     try:
         return subprocess.run(["op", *args], capture_output=True, text=True,
                               env=ENV, timeout=timeout).stdout
@@ -350,6 +358,10 @@ def curl(url, *extra, t=10, verify=True, stdin=None):
 
     Note an HTTP error is a COMPLETED transfer — 400 or 401 means the far end answered, and
     curl exits 0. Only a transport failure (DNS, refused, TLS, timeout) exits non-zero."""
+    # The method is inferred from the flags rather than stated, so it stays true if a call
+    # changes shape. Query string dropped: it is where secrets ride.
+    note_op(f"{'POST' if any(a in ('-d', '--data') for a in extra) else 'GET'} "
+            f"{re.sub(r'^[a-z]+://', '', url).split('?')[0]}")
     flags = ["-s"] if verify else ["-sk"]
     r = subprocess.run(["curl", *flags, "--max-time", str(t), *extra, url],
                        capture_output=True, text=True,
@@ -506,6 +518,7 @@ def ssh_probe(user, host, pw, expect_token, cmd):
             "-o", "ConnectTimeout=10", "-o", "PubkeyAuthentication=no",
             "-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=password",
             f"{user}@{host}", cmd]
+    note_op(f"ssh {user}@{host}" + (f" -- {cmd}" if cmd else ""))
     c = pexpect.spawn("ssh", args, encoding="utf-8", timeout=25)
     try:
         if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
@@ -537,6 +550,7 @@ def aruba_probe(user, host, pw):
             "-o ConnectTimeout=12 -o PubkeyAuthentication=no "
             "-o NumberOfPasswordPrompts=1 "
             "-o PreferredAuthentications=password,keyboard-interactive")
+    note_op(f"ssh {user}@{host} -- prompt")
     c = pexpect.spawn(f"ssh {opts} {user}@{host}", encoding="utf-8",
                       timeout=25, dimensions=(200, 400))
     try:
@@ -589,6 +603,10 @@ def auth_probe(r):
         if r["platform"] == "synology":
             u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
             base = f"https://{host}:5001/webapi/entry.cgi"
+            # Recorded here because this probe drives curl directly rather than through
+            # curl(), for the logout it has to issue. A call that skips the helper skips the
+            # recorder too, and the row would claim nothing was checked.
+            note_op(f"GET {host}:5001/webapi/entry.cgi SYNO.API.Auth")
             out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
                 "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
                 "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
@@ -688,6 +706,7 @@ def auth_probe(r):
                 # thread pool the WHOLE directory hangs — the session hook dies at 60s with no
                 # lab state, the MCP server at 120s. One row's credential is not worth that.
                 try:
+                    note_op("gh auth token")
                     k, src = subprocess.run(["gh", "auth", "token"], capture_output=True,
                                             text=True, timeout=10).stdout.strip(), "gh"
                 except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -711,6 +730,7 @@ def auth_probe(r):
             # the invariant — a secret passed as an argument is readable by any local process
             # from `ps`, and lands verbatim in any sample or spindump swept into a diagnostic
             # bundle. The KEEP whitelist guards the output path; argv was leaking out the side.
+            note_op("GET api.github.com/user")
             r_ = subprocess.run(["curl", "-s", "-D", "/dev/stderr", "--max-time", "10",
                                  "--config", "-",
                                  "-H", "Accept: application/vnd.github+json",
@@ -824,18 +844,34 @@ def tenant_reach(r):
     return None, ""
 
 
-def describe_check(r, ran):
-    """What this row's probe actually did, for --check and --json.
+def describe_check(r):
+    """What this row's probe actually did, read back from what it recorded.
 
-    `ran` is whether a probe returned a verdict. It is the guard against this table and
-    auth_probe's dispatch drifting apart: a platform that gained a probe but no CHECKS entry
-    would otherwise claim "no probe" while quietly testing something, which is precisely the
-    confident-and-wrong output this tool may not produce. It says so instead."""
-    tmpl = CHECKS.get(r["platform"])
-    if tmpl:
-        return tmpl.format(acct=r.get("account") or "?")
-    return ("probe ran, undescribed" if ran
-            else f"no probe for {r['platform'] or 'unknown platform'}")
+    Nothing recorded means nothing ran, and the honest answer is "-" — the same dash REACH
+    and AUTH use for untested, meaning the same thing. It is not a claim that no probe could
+    exist; it is the absence of one, which is what you want to see for a platform whose probe
+    has not been written yet.
+
+    The table gets the HOST that was contacted and how many calls went to it; --json gets the
+    full operations under `probe_ops`. That split is deliberate. The full paths carry a tenant
+    GUID twice and run to 150 characters, which no column can hold, and the question this
+    column exists to answer is "what did you actually talk to" — `api.github.com`, not
+    `github.com`. The paths are detail, and detail belongs where there is no width limit."""
+    ops = PROBE_OPS.get(r["id"]) or []
+    if not ops:
+        return ""                      # nothing ran; "-" is the honest answer, as for AUTH
+    web = [o for o in ops if o.startswith(("GET ", "POST "))]
+    if not web:
+        # op whoami, gh auth token, ssh user@host — the command is already the answer. The
+        # remote command is dropped: "-- echo wblv-ok" is how the login is proven, not what
+        # was contacted, and it is in probe_ops for anyone who wants it.
+        return " + ".join(o.split(" -- ")[0] for o in ops)
+    hosts = []
+    for o in web:
+        h = o.split()[1].split("/")[0]
+        if h not in hosts:
+            hosts.append(h)
+    return ", ".join(hosts) + (f" ({len(web)})" if len(web) > 1 else "")
 
 
 def probe(r):
@@ -847,6 +883,9 @@ def probe(r):
     in this lab — only a vendor's URL — so the heartbeat has to be scoped to the tenant, or
     else derived from the one call that does reach it. The vendor front door is never the
     answer for a service, which is why reach_probe() is not in that path at all."""
+    # Every operation recorded from here on belongs to this member. Thread-local because the
+    # probes run in a pool, and one worker handles one member at a time.
+    _CUR.id = r["id"]
     host = r.get("fqdn") or r["endpoint"]
     port = r.get("port")
     hostless = r["platform"] in HOSTLESS_ROLES
@@ -863,7 +902,7 @@ def probe(r):
     if not host and not service:
         return {**r, "reach": None, "auth": None, "auth_detail": "",
                 "reach_basis": "untested", "access_unreachable": False,
-                "cred_fallback": False, "check": describe_check(r, False)}
+                "cred_fallback": False, "check": describe_check(r), "probe_ops": []}
 
     if service:
         reach, basis = tenant_reach(r)
@@ -905,7 +944,7 @@ def probe(r):
     return {**r, "reach": reach, "auth": ok, "auth_detail": detail,
             "reach_basis": basis or "untested", "access_unreachable": access_bad,
             "cred_fallback": r["id"] in CRED_FALLBACK,
-            "check": describe_check(r, ok is not None)}
+            "check": describe_check(r), "probe_ops": list(PROBE_OPS.get(r["id"]) or [])}
 
 
 # Filtering here rather than at print time: a filtered view has no reason to probe hosts it
@@ -1068,7 +1107,7 @@ if __name__ == "__main__":
         # consumer branching on the set would otherwise default an unmeasured member into
         # whichever bucket it happened to fall through to.
         KEEP = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
-                "access", "check", "reach", "reach_basis", "auth", "auth_detail", "item", "account",
+                "access", "check", "probe_ops", "reach", "reach_basis", "auth", "auth_detail", "item", "account",
                 "endpoint", "endpoint_malformed", "access_unreachable", "cred_fallback",
                 "zone", "live_ip", "ip_drift", "platform", "name_collision")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},

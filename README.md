@@ -94,21 +94,32 @@ coincide. For a service it is the **admin console** — `portal.azure.com`, not
 to `api.github.com`.
 
 Sitting between `ADDRESS` and `REACH`, that column reads as the thing those signals
-measured, and for a service it never was. `--check` swaps it for the mechanism:
+measured, and for a service it never was. `--check` swaps it for what the probe actually
+contacted:
 
 ```
-wap-01   physical   down   -     no probe for omada
-365-01   service    up     ok    OIDC discovery + client-creds
-git-01   service    up     ok    GET /users/wblv-dev + /user
+wap-01   physical   down   -     -
+365-01   service    up     ok    login.microsoftonline.com (2)
+git-01   service    up     ok    api.github.com (2)
 ops-01   service    up     ok    op whoami
 ```
 
-Same column, so the table does not grow. `--json` carries `access` and `check` together,
-since there is no width to spend there.
+Same column, so the table does not grow. `--json` adds `probe_ops` with every operation in
+full — paths included — since there is no width to spend there.
 
-It also makes an untested member say so: `no probe for omada` distinguishes *no probe
-written yet* from *a platform string that matches nothing* — two states that otherwise both
-render as a bare `-` in `AUTH`.
+**It is recorded, not described.** The probe helpers append what they ran, and the column
+reads that back. A hand-written table of "what each platform does" would be a fact that
+goes stale silently: add an Omada probe and it would still say *no probe*; change how a
+credential is exercised and it would still claim the old method. Same failure as writing a
+device's address into a note. Adding a probe makes its row describe itself, with no second
+place to update.
+
+A member with nothing recorded shows `-` — the same dash `REACH` and `AUTH` use, meaning
+the same thing: nothing was measured. That is `wap-01` today, and it will become an Omada
+endpoint the moment that probe exists, without anyone editing a description.
+
+Only the operation is recorded, never its credentials — the URL without its query string,
+the command without its arguments.
 
 ## ZONE and FAULT
 

@@ -82,9 +82,13 @@ def wblv_lab(type: str = "") -> str:
     when the far end actually answered no. Do not read a null AUTH as a bad credential.
 
     `access` is where a HUMAN connects — for a service that is the admin console, not the API
-    the probe used. `check` names what was actually done to produce REACH and AUTH ("op
-    whoami", "GET /users/wblv-dev + /user", "no probe for omada"). Quote `access` when telling
-    someone how to reach a member, and `check` when explaining what a green row is based on.
+    the probe used. `check` names what was actually contacted, and `probe_ops` lists every
+    operation in full. Both are RECORDED from the probe run, not descriptions, so they are
+    true for the run you are reading. An empty `check` means nothing was measured — the same
+    meaning as a null REACH — not that the member is fine.
+
+    Quote `access` when telling someone how to reach a member, and `check`/`probe_ops` when
+    explaining what a green row is actually based on.
 
     Args:
         type: optional filter — "physical", "virtual" or "service". Empty returns everything.
