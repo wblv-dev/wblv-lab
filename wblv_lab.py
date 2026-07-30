@@ -155,7 +155,10 @@ machine named in "Probing from", whose own zone is shown for exactly that reason
 
 ACCESS is where YOU connect -- for a service that is the admin console, which is
 deliberately not what the probe talks to (nobody logs in to api.github.com). --check
-swaps the column for the mechanism that was actually used, and --json carries both.
+swaps the column for what was actually contacted: the operation that produced AUTH, or
+the reach test where no login was attempted, and in brackets how many ran in total.
+Every operation in full is in --json under probe_ops. Both are RECORDED during the run,
+so they describe what happened rather than what the code is expected to do.
 
 FAULT names what disagrees, and is blank when nothing does. 'url' -- the item's URL field
 holds no usable hostname. 'ip' -- the DHCP reservation and the live address differ, a lease
@@ -606,7 +609,7 @@ def auth_probe(r):
             # Recorded here because this probe drives curl directly rather than through
             # curl(), for the logout it has to issue. A call that skips the helper skips the
             # recorder too, and the row would claim nothing was checked.
-            note_op(f"GET {host}:5001/webapi/entry.cgi SYNO.API.Auth")
+            note_op(f"GET {host}:5001/webapi/entry.cgi")
             out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
                 "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
                 "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
@@ -768,6 +771,11 @@ def reach_probe(host, port):
 
     The timeouts themselves are deliberately NOT reduced. They are what stops a slow-but-alive
     host being reported as down, and a false 'down' is the failure this tool exists to avoid."""
+    # Recorded like every other operation, so CHECK accounts for REACH as well as AUTH. Both
+    # are noted because both are attempted: they are raced, and either answering is the result.
+    if port:
+        note_op(f"tcp {host}:{port}")
+    note_op(f"ping {host}")
     with ThreadPoolExecutor(max_workers=2) as ex:
         futures = ([ex.submit(nc_open, host, port)] if port else []) + [ex.submit(ping_ok, host)]
         return any(f.result() for f in futures)
@@ -852,26 +860,22 @@ def describe_check(r):
     exist; it is the absence of one, which is what you want to see for a platform whose probe
     has not been written yet.
 
-    The table gets the HOST that was contacted and how many calls went to it; --json gets the
-    full operations under `probe_ops`. That split is deliberate. The full paths carry a tenant
-    GUID twice and run to 150 characters, which no column can hold, and the question this
-    column exists to answer is "what did you actually talk to" — `api.github.com`, not
-    `github.com`. The paths are detail, and detail belongs where there is no width limit."""
+    The table gets the PRIMARY operation and a count of everything else; --json gets the lot
+    under `probe_ops`. Primary means the one that produced AUTH, falling back to the reach
+    test when no login was attempted — so wap-01, which has no probe written, still says what
+    was tried rather than going blank. The full M365 form carries a tenant GUID twice and runs
+    past 150 characters, which is why the detail belongs where there is no width to spend."""
     ops = PROBE_OPS.get(r["id"]) or []
     if not ops:
-        return ""                      # nothing ran; "-" is the honest answer, as for AUTH
-    web = [o for o in ops if o.startswith(("GET ", "POST "))]
-    if not web:
-        # op whoami, gh auth token, ssh user@host — the command is already the answer. The
-        # remote command is dropped: "-- echo wblv-ok" is how the login is proven, not what
-        # was contacted, and it is in probe_ops for anyone who wants it.
-        return " + ".join(o.split(" -- ")[0] for o in ops)
-    hosts = []
-    for o in web:
-        h = o.split()[1].split("/")[0]
-        if h not in hosts:
-            hosts.append(h)
-    return ", ".join(hosts) + (f" ({len(web)})" if len(web) > 1 else "")
+        return ""                      # nothing ran at all; "-" is the honest answer
+    auth_ops = [o for o in ops if not o.startswith(("tcp ", "ping "))]
+    primary = (auth_ops or ops)[0]
+    # A URL collapses to its host: the path is the least surprising part and the longest.
+    # Anything else — ssh, op, gh — is already the answer, minus the remote command, which is
+    # how the login is proven rather than what was contacted.
+    shown = (primary.split()[1].split("/")[0] if primary.startswith(("GET ", "POST "))
+             else primary.split(" -- ")[0])
+    return shown + (f" ({len(ops)})" if len(ops) > 1 else "")
 
 
 def probe(r):

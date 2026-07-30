@@ -94,18 +94,25 @@ coincide. For a service it is the **admin console** — `portal.azure.com`, not
 to `api.github.com`.
 
 Sitting between `ADDRESS` and `REACH`, that column reads as the thing those signals
-measured, and for a service it never was. `--check` swaps it for what the probe actually
+measured, and for a service it never was. `--check` swaps it for what was actually
 contacted:
 
 ```
-wap-01   physical   down   -     -
-365-01   service    up     ok    login.microsoftonline.com (2)
-git-01   service    up     ok    api.github.com (2)
+rpi-01   physical   up     ok    ssh claude@rpi-01.wblv.uk (3)
+wap-01   physical   down   -     tcp wap-01.wblv.uk:443 (2)
+365-01   service    up     ok    login.microsoftonline.com (4)
+git-01   service    up     ok    api.github.com (4)
 ops-01   service    up     ok    op whoami
 ```
 
+The cell names the operation that produced `AUTH` — or the reach test, where no login was
+attempted — and in brackets how many operations ran in total. So `wap-01`, which has no
+probe written, still reports what was tried instead of going blank.
+
 Same column, so the table does not grow. `--json` adds `probe_ops` with every operation in
-full — paths included — since there is no width to spend there.
+full — paths included — since there is no width to spend there. That is where you can see
+`365-01` verified `portal.azure.com` as well as authenticating against
+`login.microsoftonline.com`: `CHECK` covers both `REACH` and `AUTH`.
 
 **It is recorded, not described.** The probe helpers append what they ran, and the column
 reads that back. A hand-written table of "what each platform does" would be a fact that
@@ -115,8 +122,8 @@ device's address into a note. Adding a probe makes its row describe itself, with
 place to update.
 
 A member with nothing recorded shows `-` — the same dash `REACH` and `AUTH` use, meaning
-the same thing: nothing was measured. That is `wap-01` today, and it will become an Omada
-endpoint the moment that probe exists, without anyone editing a description.
+the same thing: nothing was measured. `wap-01` reports its reach test today and will name
+an Omada endpoint the moment that probe exists, without anyone editing a description.
 
 Only the operation is recorded, never its credentials — the URL without its query string,
 the command without its arguments.
