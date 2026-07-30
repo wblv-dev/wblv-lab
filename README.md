@@ -12,6 +12,7 @@ wblv-lab -s         services
 wblv-lab --mac      add the MAC column
 wblv-lab --check    swap ACCESS for what each probe actually did
 wblv-lab --json     machine-readable
+wblv-lab --test     every view in turn, from a single probe pass
 ```
 
 ## Why it exists
@@ -85,6 +86,31 @@ on the heartbeat while nothing had been reached, and the credential wrongly blam
 Both are measured **from the machine running the tool**, which is why its own zone is
 printed. `rpi-01 / LAN / up` only means "a pinhole is open" if you know the prober is in
 `ADM`.
+
+## Nothing about this lab is written down
+
+No address, no hostname, no naming convention. A member's role, its API dialect, its scheme
+and its port all come from its own vault item — and so does the router that supplies the
+inventory, which is found by the platform it declares rather than by its name.
+
+That last one used to be a three-character hostname prefix. It meant renaming the router, or
+replacing OPNsense with pfSense, would not degrade the tool but kill it — and the assumption
+was invisible, buried in a lookup rather than declared. A member called `fw-core-99` now
+serves the IPAM perfectly well, provided its item says `Platform: opnsense`.
+
+What remains in code is knowledge of **vendors' APIs**: which dialect each platform speaks,
+and where its endpoint lives. Those change when a vendor changes, not when you rename a box.
+
+## `--test`
+
+Runs every view in turn — each filter, each flag combination, `--json` and `-h` — from a
+**single probe pass**. Useful for pasting the whole surface into a conversation.
+
+The single pass is the point. Nine separate invocations would fire nine rounds of SSH logins
+at the hosts that use them, which is how you trip the brute-force lockout standard #13 exists
+to enable. Probing is the expensive and risky part; rendering is free, so only rendering
+repeats. The corollary when reading the output: every view is the *same* measurement, so the
+rows agree by construction.
 
 ## ACCESS is where you connect, not what was checked
 

@@ -10,8 +10,11 @@ Authorities, in order of use:
   OPNsense    detail. Dnsmasq reservations are the IPAM; ARP supplies the live vendor string.
   the network everything else: reachability and a real login are measured, never recorded.
 
-Nothing here is cached and nothing is hardcoded. The only seed is this machine's own
-resolver, which is maintained by the network rather than by us.
+Nothing here is cached, and nothing about THIS lab is written down: no address, no hostname,
+no naming convention. Every member, and the router that supplies the inventory, is found by
+what its vault item declares it is. What remains in code is knowledge of vendors' APIs — the
+dialect each platform speaks, and where its endpoint lives — which changes when a vendor
+changes, not when Harry renames a box.
 """
 import os, sys, json, re, socket, subprocess, threading, time
 try:
@@ -24,20 +27,16 @@ _T0 = time.time()          # for the Runtime stat: measured, not estimated
 
 TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 
-# The one convention this tool assumes: hostnames are prefixed by device type. It is Harry's
-# own naming standard, it decides the access mechanism, and it is the only thing here that
-# could be called a hardcoded fact — so it is small, visible, and in exactly one place.
+# Platforms whose API can serve the lab's IPAM. This is a VENDOR fact — "can I read Dnsmasq
+# reservations from this dialect" — not a fact about Harry's lab, which is why it survives him
+# renaming or replacing the box. The router used to be found by a three-character hostname
+# prefix, which meant a rename or a swap to pfSense did not degrade the tool, it killed it,
+# and the assumption was invisible: buried in a next() rather than declared.
 #
-# ONBOARDING A NEW DEVICE TYPE: add a prefix and an access description. Onboarding a new HOST
-# of an existing type needs nothing here at all — just the 1Password item.
-ROLES = {                     # prefix -> (role, protocol, port)
-    "opn": ("opnsense",     "https",  443),
-    "nas": ("synology",     "https", 5001),
-    "swt": ("aruba-switch", "ssh",     22),
-    "rpi": ("linux",        "ssh",     22),
-    "wap": ("tplink-ap",    "https",  443),
-    "pve": ("proxmox",      "https", 8006),
-}
+# Everything else a member needs — its role, its API dialect, its scheme and port — now comes
+# from its own vault item. There is no prefix table any more, so onboarding any device of any
+# type is entirely data: create the item, and it appears.
+IPAM_PLATFORMS = ("opnsense",)
 
 # Credentials are held OUT of the member records so they cannot reach stdout. Output rows are
 # built from an explicit whitelist below; a secret must never be one accidental print away.
@@ -109,6 +108,18 @@ ALIASES = {
     "url": "website", "endpoint": "website",
 }
 
+# Explicit whitelist for --json: credentials live in CREDS and must never be one careless
+# print away. reach_basis says WHICH measurement produced REACH — "endpoint" (the address
+# answered), "tenant" (a tenant-scoped call answered), "derived" (the auth probe reached it,
+# and nothing weaker could) or "untested" (nothing could be measured). Two rows both reading
+# reach:true are not making the same claim, and a machine consuming this should be able to
+# tell. It is never absent and never empty: a consumer branching on the set would otherwise
+# default an unmeasured member into whichever bucket it happened to fall through to.
+KEEP_JSON = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
+             "access", "check", "probe_ops", "reach", "reach_basis", "auth", "auth_detail",
+             "item", "account", "endpoint", "endpoint_malformed", "access_unreachable",
+             "cred_fallback", "zone", "live_ip", "ip_drift", "platform", "name_collision")
+
 HYPERVISORS = ("proxmox", "vmware", "qemu", "kvm", "xen", "microsoft corporation",
                "oracle virtualbox", "nutanix", "parallels", "red hat")
 
@@ -134,6 +145,7 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab --mac        add the MAC column
   wblv-lab --check      swap ACCESS for what each probe actually did
   wblv-lab --json       machine-readable
+  wblv-lab --test       every view in turn, from a single probe pass
   wblv-lab -h           this text
 
 Membership comes from 1Password: an item is what makes something a member, so adding one
@@ -195,6 +207,10 @@ SHOW_MAC = "--mac" in sys.argv
 # its width. The two answer different questions and only a machine wants both at once, which
 # is what --json is for.
 SHOW_CHECK = "--check" in sys.argv
+
+# Every view from one probe pass, so a whole-surface check can be pasted into a conversation
+# without running the probes nine times.
+SHOW_TEST = "--test" in sys.argv
 
 
 # --- 1Password substrate ------------------------------------------------------------------
@@ -372,10 +388,15 @@ def curl(url, *extra, t=10, verify=True, stdin=None):
     return r.returncode == 0, r.stdout
 
 
-opn = next((m for m in members if m["name"].startswith("opn")), None)
+def _platform_of(m):
+    return (CREDS.get(m["id"], {}).get("platform")
+            or CREDS.get(m["id"], {}).get("role") or "").strip().lower()
+
+
+opn = next((m for m in members if _platform_of(m) in IPAM_PLATFORMS), None)
 if not opn:
-    die("no OPNsense member in the vault — cannot read the lab's IPAM",
-        hint="an item whose URL host starts 'opn-' supplies the inventory")
+    die("no member declares a platform that can serve the IPAM — cannot read the lab",
+        hint=f"one vault item needs Platform set to one of: {', '.join(IPAM_PLATFORMS)}")
 
 # Every item's fields were already read when membership was resolved. Fetching this one
 # again cost a second `op item get` — about a second — for bytes we were already holding.
@@ -447,21 +468,19 @@ def classify(m):
     rather than quietly resolved — same idea as the IPAM reserved-vs-live drift check. Neither
     signal is discarded, because each catches what the other cannot."""
     inv = inventory.get(m["name"], {})
-    role, proto, port = ROLES.get(m["name"][:3], ("", "", None))
-    # A `role` field on the vault item wins over the hostname prefix. The prefix table is a
-    # naming convention for machines Harry racked; it says nothing useful about a tenant. This
-    # keeps onboarding a service to "add an item", with no code change.
     # Two attributes, deliberately separate. PLATFORM is the API dialect and selects the auth
     # probe — it changes entirely if OPNsense becomes pfSense. ROLE is what the thing is for and
     # survives that swap untouched. Collapsing them made "role" mean two things at once.
     # While items are being migrated, a lone `role` is still accepted as the platform.
     _c = CREDS.get(m["id"], {})
-    platform = (_c.get("platform") or _c.get("role") or role).strip().lower()
+    platform = (_c.get("platform") or _c.get("role") or "").strip().lower()
     role = (_c.get("role") if _c.get("platform") else "").strip().lower()
-    # Fall back to what the URL states. ROLES still wins where it has an entry, because it
-    # names the MANAGEMENT port, which is often not the port in the browser URL (DSM: 5001).
-    if port is None and m.get("url_port"):
-        proto, port = (proto or m.get("scheme") or "https"), m["url_port"]
+    # The item states how it is reached, so the tool no longer infers it from a naming
+    # convention. This used to come from a prefix table that named the MANAGEMENT port —
+    # necessary while items carried a bare browser URL, and wrong the moment one didn't. Every
+    # item now carries a real scheme, with an explicit port wherever it is not the default, so
+    # the table had nothing left to add and a rename can no longer change how a host is read.
+    proto, port = (m.get("scheme") or ""), m.get("url_port")
     _a = arp.get(inv.get("mac", ""), {})
     vendor = _a.get("manufacturer", "")
     zone = _a.get("intf_description", "")      # LAN / ADM / PLY, straight off the interface
@@ -605,11 +624,14 @@ def auth_probe(r):
             return (bool(v), f"OPNsense {v}" if v else "API rejected the credential")
         if r["platform"] == "synology":
             u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
-            base = f"https://{host}:5001/webapi/entry.cgi"
+            # The port comes from the member, not from a literal. It was written here AND in
+            # the prefix table, so the two could disagree with nothing to catch it.
+            dsm = r.get("port") or 5001
+            base = f"https://{host}:{dsm}/webapi/entry.cgi"
             # Recorded here because this probe drives curl directly rather than through
             # curl(), for the logout it has to issue. A call that skips the helper skips the
             # recorder too, and the row would claim nothing was checked.
-            note_op(f"GET {host}:5001/webapi/entry.cgi")
+            note_op(f"GET {host}:{dsm}/webapi/entry.cgi")
             out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
                 "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
                 "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
@@ -1102,19 +1124,37 @@ if __name__ == "__main__":
             "runtime_s": round(time.time() - _T0, 1), "off_directory": OFF_DIRECTORY,
             "token_file_age_days": TOKEN_FILE_AGE_DAYS}
     if "--json" in sys.argv:
-        # Explicit whitelist: credentials live in CREDS and must never be one careless print away.
-        # reach_basis says WHICH measurement produced REACH — "endpoint" (the address
-        # answered), "tenant" (a tenant-scoped call answered), "derived" (the auth probe
-        # reached it, and nothing weaker could) or "untested" (nothing could be measured).
-        # Two rows both reading reach:true are not making the same claim, and a machine
-        # consuming this should be able to tell. It is never absent and never empty: a
-        # consumer branching on the set would otherwise default an unmeasured member into
-        # whichever bucket it happened to fall through to.
-        KEEP = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
-                "access", "check", "probe_ops", "reach", "reach_basis", "auth", "auth_detail", "item", "account",
-                "endpoint", "endpoint_malformed", "access_unreachable", "cred_fallback",
-                "zone", "live_ip", "ip_drift", "platform", "name_collision")
-        print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP} for r in shown]},
+        print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON} for r in shown]},
                          indent=2))
+    elif SHOW_TEST:
+        # Every view, from ONE probe pass. Running the CLI nine times would be the obvious
+        # implementation and the wrong one: it would take nine times as long, and it would
+        # fire nine rounds of SSH logins at rpi-01 and swt-01, which is how you trip the
+        # brute-force lockout that standard #13 exists to enable. Probing is the expensive and
+        # risky part; rendering is free, so it is the only part repeated.
+        #
+        # A consequence worth knowing when reading the output: every view below is the SAME
+        # measurement, so the rows agree with each other by construction. This shows what each
+        # flag renders, not that nine separate runs would agree.
+        VIEWS = [
+            ("wblv-lab",               set(),          False, False),
+            ("wblv-lab -p",            {"physical"},   False, False),
+            ("wblv-lab -v",            {"virtual"},    False, False),
+            ("wblv-lab -s",            {"service"},    False, False),
+            ("wblv-lab --mac",         set(),          True,  False),
+            ("wblv-lab --check",       set(),          False, True),
+            ("wblv-lab --check --mac", set(),          True,  True),
+            ("wblv-lab -p --check",    {"physical"},   False, True),
+            ("wblv-lab -s --check",    {"service"},    False, True),
+        ]
+        for label, want, mac, chk in VIEWS:
+            SHOW_MAC, SHOW_CHECK = mac, chk
+            print(f"\n{'=' * 78}\n$ {label}\n{'=' * 78}")
+            render([r for r in shown if not want or r["type"] in want], meta)
+        print(f"\n{'=' * 78}\n$ wblv-lab --json\n{'=' * 78}")
+        print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON}
+                                              for r in shown]}, indent=2))
+        print(f"\n{'=' * 78}\n$ wblv-lab -h\n{'=' * 78}")
+        print(HELP)
     else:
         render(shown, meta)
