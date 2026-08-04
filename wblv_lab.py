@@ -523,7 +523,7 @@ def nc_open(host, port, t=3):
 def ping_ok(host, t=2):
     return subprocess.run(["ping", "-c", "1", "-t", str(t), host], capture_output=True).returncode == 0
 
-def ssh_probe(user, host, pw, expect_token, cmd):
+def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
     """Password SSH, one mechanism for every host — consistency over key management.
 
     PubkeyAuthentication=no and PreferredAuthentications=password force the path we are
@@ -538,8 +538,19 @@ def ssh_probe(user, host, pw, expect_token, cmd):
         return None, "no password field on the 1Password item"
     args = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=10", "-o", "PubkeyAuthentication=no",
-            "-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=password",
-            f"{user}@{host}", cmd]
+            "-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=password"]
+    if legacy:
+        # Appliances whose SSH predates current defaults. Modern OpenSSH refuses to negotiate
+        # with them at all, and it fails BEFORE the password prompt — so without this the probe
+        # reports "SSH refused before auth" for a device that is perfectly healthy, a false
+        # negative indistinguishable from a real fault. Asked for explicitly, per platform,
+        # rather than globally: weakening the client for every host to suit the worst one is
+        # how a workaround becomes the standard.
+        args += ["-o", "HostKeyAlgorithms=+ssh-rsa",
+                 "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+                 "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+                 "-o", "Ciphers=+aes128-cbc"]
+    args += [f"{user}@{host}", cmd]
     note_op(f"ssh {user}@{host}" + (f" -- {cmd}" if cmd else ""))
     c = pexpect.spawn("ssh", args, encoding="utf-8", timeout=25)
     try:
@@ -644,7 +655,7 @@ def auth_probe(r):
                     "--data-urlencode", "method=logout", "--data-urlencode", "session=FileStation",
                     "--data-urlencode", f"_sid={sid}"], capture_output=True)
             return (bool(sid), "DSM login ok" if sid else "DSM rejected the credential")
-        if r["platform"] in ("aruba-switch", "linux"):
+        if r["platform"] in ("aruba-switch", "linux", "tplink-eap"):
             u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
             pw = (c.get("password") or c.get("confirmpassword")
                   or c.get("operator password", "")).removeprefix("password=")
@@ -654,7 +665,12 @@ def auth_probe(r):
             # its own name, the shell echoes a token we chose.
             if r["platform"] == "aruba-switch":
                 return aruba_probe(u, host, pw)
-            return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok")
+            # A standalone TP-Link EAP answers SSH with an unprivileged BusyBox ash shell
+            # (uid 1, cannot even write /dev/null), not the restricted CLI its GUI implies, so
+            # the same echo test proves the session for real. Its host keys are ssh-rsa/ssh-dss
+            # only, hence legacy.
+            return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok",
+                             legacy=r["platform"] == "tplink-eap")
         if r["platform"] == "microsoft-graph":
             # Client-credentials against the tenant. A token issued is proof the app
             # registration, the secret and the tenant are all live — which is what "is M365
@@ -884,8 +900,8 @@ def describe_check(r):
 
     The table gets the PRIMARY operation and a count of everything else; --json gets the lot
     under `probe_ops`. Primary means the one that produced AUTH, falling back to the reach
-    test when no login was attempted — so wap-01, which has no probe written, still says what
-    was tried rather than going blank. The full M365 form carries a tenant GUID twice and runs
+    test when no login was attempted — so a member whose platform has no probe written still
+    says what was tried rather than going blank. The full M365 form carries a tenant GUID twice and runs
     past 150 characters, which is why the detail belongs where there is no width to spend."""
     ops = PROBE_OPS.get(r["id"]) or []
     if not ops:
