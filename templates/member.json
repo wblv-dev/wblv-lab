@@ -12,6 +12,9 @@
     { "id": "password", "type": "CONCEALED", "purpose": "PASSWORD", "label": "password", "value": "" },
     { "id": "notesPlain", "type": "STRING", "purpose": "NOTES", "label": "notesPlain", "value": "" },
 
+    { "id": "dns_name", "section": { "id": "wblv" }, "type": "STRING", "label": "DNS Name", "value": "" },
+    { "id": "website", "section": { "id": "wblv" }, "type": "STRING", "label": "Website", "value": "" },
+
     { "id": "role", "section": { "id": "wblv" }, "type": "STRING", "label": "Role", "value": "" },
     { "id": "platform", "section": { "id": "wblv" }, "type": "STRING", "label": "Platform", "value": "" },
 
@@ -22,6 +25,6 @@
     { "id": "client_id", "section": { "id": "wblv" }, "type": "STRING", "label": "Client ID", "value": "" },
     { "id": "client_secret", "section": { "id": "wblv" }, "type": "CONCEALED", "label": "Client Secret", "value": "" },
 
-    { "id": "expiry", "section": { "id": "wblv" }, "type": "STRING", "label": "Expiry", "value": "" }
+    { "id": "expiry", "section": { "id": "wblv" }, "type": "STRING", "label": "Expiry Date", "value": "" }
   ]
 }
