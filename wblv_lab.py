@@ -16,7 +16,7 @@ what its vault item declares it is. What remains in code is knowledge of vendors
 dialect each platform speaks, and where its endpoint lives — which changes when a vendor
 changes, not when Harry renames a box.
 """
-import os, sys, json, re, socket, subprocess, threading, time
+import os, sys, json, re, socket, subprocess, threading, time, datetime
 try:
     import pexpect
 except ImportError:
@@ -108,6 +108,48 @@ ALIASES = {
     "url": "website", "endpoint": "website",
 }
 
+
+def _fold(label):
+    """One spelling for a hand-typed GUI label: lowercased, spaces and hyphens to underscores.
+
+    'DNS Name', 'dns name' and 'dns-name' are the same field. A label that silently failed to
+    match would be indistinguishable from a field nobody filled in."""
+    return re.sub(r"[\s\-]+", "_", (label or "").strip().lower())
+
+
+# How near is near. A credential is worth warning about while there is still time to rotate it
+# calmly; earlier than this and the warning is permanent furniture, which is the same as absent.
+EXPIRY_WARN_DAYS = 45
+
+
+def _expiry_days(value):
+    """Days until a recorded credential expiry, or None if none is recorded or it is unparseable.
+
+    Day-first, because that is how the vault's dates are written (23/07/2028) and how Harry
+    types them. Guessing month-first would silently move a date by up to eleven months and
+    still look like a valid answer -- so an unrecognised string returns None and says nothing,
+    rather than inventing a deadline. ISO is accepted too, being unambiguous."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+        try:
+            due = datetime.datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+        return (due - datetime.date.today()).days
+    return None
+
+
+def _field(full, *names):
+    """First non-empty value among the given field labels, matched forgivingly.
+
+    Reads `fields` only. The vault's items keep every real value there -- their `urls` arrays
+    are empty -- so a reader that consults only `urls` sees nothing at all."""
+    want = {_fold(n) for n in names}
+    return next((f.get("value").strip() for f in (full.get("fields") or [])
+                 if _fold(f.get("label")) in want and (f.get("value") or "").strip()), "")
+
 # Explicit whitelist for --json: credentials live in CREDS and must never be one careless
 # print away. reach_basis says WHICH measurement produced REACH — "endpoint" (the address
 # answered), "tenant" (a tenant-scoped call answered), "derived" (the auth probe reached it,
@@ -118,7 +160,11 @@ ALIASES = {
 KEEP_JSON = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
              "access", "check", "probe_ops", "reach", "reach_basis", "auth", "auth_detail",
              "item", "account", "endpoint", "endpoint_malformed", "access_unreachable",
-             "cred_fallback", "zone", "live_ip", "ip_drift", "platform", "name_collision")
+             "cred_fallback", "zone", "live_ip", "ip_drift", "platform", "name_collision",
+             # Both spellings are kept, not just the winner: a `name` fault says the two
+             # disagree, and the consumer cannot act on that without seeing each of them.
+             # cred_expiry is days remaining — negative means already expired.
+             "declared_name", "derived_name", "name_mismatch", "cred_expiry")
 
 HYPERVISORS = ("proxmox", "vmware", "qemu", "kvm", "xen", "microsoft corporation",
                "oracle virtualbox", "nutanix", "parallels", "red hat")
@@ -172,12 +218,22 @@ the reach test where no login was attempted, and in brackets how many ran in tot
 Every operation in full is in --json under probe_ops. Both are RECORDED during the run,
 so they describe what happened rather than what the code is expected to do.
 
+A member's identity is DECLARED, in the item's 'DNS Name' field, not derived from its URL or
+its title. A derived name moves when something unrelated changes -- repoint a host and it was
+renamed -- and the name is what the drift and duplicate checks key off. Derivation remains
+only as the fallback for an item that has not declared one.
+
 FAULT names what disagrees, and is blank when nothing does. 'url' -- the item's URL field
 holds no usable hostname. 'ip' -- the DHCP reservation and the live address differ, a lease
 that outlived the change which created it. 'tag' -- the declared type and the wire disagree.
-'access' -- the member answered, but the URI in the ACCESS column did not. 'cred' -- AUTH
-passed on a credential this machine holds, not the one the item carries, so the item is
-untested. 'dup' -- two items resolve to one name, so one of them is a member you cannot see.
+'name' -- the declared name and the endpoint disagree, so one of the two fields is stale and
+the tool cannot tell which. Services are exempt: their endpoint is the vendor's domain, so
+365-01 pointing at portal.azure.com is correct, not broken. 'access' -- the member answered,
+but the URI in the ACCESS column did not. 'cred' -- AUTH passed on a credential this machine
+holds, not the one the item carries, so the item is untested. 'expiry' -- a recorded
+credential expiry is near or already past; a secret that expires silently takes its probe
+with it, and the probe goes red long after the warning would have been useful. 'dup' -- two
+items resolve to one name, so one of them is a member you cannot see.
 
 Non-members counts addresses OPNsense can see that no vault item claims. It says how much
 of the wire this directory accounts for; it is not a fault.
@@ -291,9 +347,16 @@ def _member(item):
     # A missing endpoint is only a FAULT if something was clearly meant to be one. An item
     # whose only URL-slot entries are labelled data (role: 1password) has no endpoint because it
     # needs none — reporting that as a malformed URL would be the tool inventing a problem.
+    #
+    # ⚠ This looked only at `urls`, and every item in the vault has an EMPTY urls array — the
+    # Website is a labelled FIELD. So `intended` was always False and the 'url' fault could not
+    # fire on any member that exists: a malformed Website would have rendered exactly like a
+    # service that legitimately has none. A check that cannot fail and a check that passes are
+    # the same silence, which is the failure mode this tool exists to refuse. Both slots now count.
     intended = any(("://" in (u.get("href") or "")) or
-                   (u.get("label") or "").strip().lower() in ("website", "url")
-                   for u in (full.get("urls") or []))
+                   _fold(u.get("label")) in ("website", "url")
+                   for u in (full.get("urls") or [])) or \
+               bool(_field(full, "website", "url", "endpoint"))
     junk = intended and not endpoint
     # A service has no meaningful hostname prefix — a SaaS tenant is not identified by the
     # first three letters of its portal's DNS name — so the URL is the only thing that states
@@ -309,13 +372,34 @@ def _member(item):
     # item look accountless next to the seven that had not been touched yet.
     user = next((f.get("value") for f in (full.get("fields") or [])
                  if (f.get("label") or "").lower() == "username" and f.get("value")), "")
-    # A machine's DNS name IS its identity, so the endpoint names it. A service's URL is the
-    # vendor's domain and names nothing useful — portal.azure.com would be "portal",
-    # login.tailscale.com "login", my.1password.com "my". For those the item title is the
-    # identity, which is also how Harry has been controlling the name all along.
+    # IDENTITY IS DECLARED, NOT DERIVED. The item states its name in `DNS Name`, and that is
+    # authoritative. Derivation stays only as the fallback for an item that has not declared one.
+    #
+    # Why it matters: derived identity MOVES when something else changes. A name taken from the
+    # endpoint follows the URL, so repointing a host at a different interface renamed it; a name
+    # taken from the title followed a rename of the credential. Neither edit is about identity,
+    # and both silently made the member look like a different member — including to the ip_drift
+    # and name_collision checks, which key off it.
+    #
+    # The declared name also unifies the two cases that used to need separate rules. A machine's
+    # DNS name is its identity, but a service's URL is the VENDOR's domain and names nothing
+    # useful — portal.azure.com would be "portal", login.tailscale.com "login". The vault answers
+    # both the same way, because every item declares a short canonical name (365-01, nas-01).
     is_service = any(t.lower() == "service" for t in (full.get("tags") or []))
+    declared = _field(full, "dns name").lower()
     from_title = title.split("/")[0].strip().lower().removeprefix("wblv-")
-    name = from_title if (is_service or not endpoint) else endpoint.split(".")[0].lower()
+    derived = from_title if (is_service or not endpoint) else endpoint.split(".")[0].lower()
+    # Tolerated rather than required: someone may reasonably write the FQDN here. The short name
+    # is the identity either way, so both spellings resolve to the same member.
+    name = declared.split(".")[0] if declared else derived
+    # A declared name that disagrees with the endpoint means one of the two fields is stale, and
+    # there is no way to tell WHICH from inside the tool — so it is reported, not resolved.
+    #
+    # Services are exempt BY DESIGN, not overlooked: their endpoint is the vendor's domain, so
+    # 365-01 vs portal.azure.com is the correct state of a healthy item. Faulting on it would
+    # light up every service permanently, and a fault that is always on is one nobody reads.
+    name_mismatch = bool(declared and endpoint and not is_service
+                         and declared.split(".")[0] != endpoint.split(".")[0].lower())
     # 1Password's Login item offers custom fields and labelled website entries, and Harry uses
     # both — the M365 tenant_id and client_id live as LABELLED URLS because that is the slot the
     # UI made easy. Reading only `fields` threw those labels away and made the data look like a
@@ -349,7 +433,9 @@ def _member(item):
     CREDS[item["id"]] = c
     return {"id": item["id"], "item": title, "endpoint": endpoint, "account": user, "name": name,
             "scheme": scheme, "url_port": url_port, "website": website,
-            "endpoint_malformed": junk, "tags": full.get("tags") or []}
+            "endpoint_malformed": junk, "tags": full.get("tags") or [],
+            "declared_name": declared, "derived_name": derived, "name_mismatch": name_mismatch,
+            "cred_expiry": _expiry_days(_field(full, "expiry date", "expiry"))}
 
 
 items = json.loads(op("item", "list", "--vault", VAULT, "--format", "json") or "[]")
@@ -1109,8 +1195,14 @@ def render(rows, meta):
                   ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
                                             ("ip", r.get("ip_drift")),
                                             ("tag", r.get("type_drift")),
+                                            ("name", r.get("name_mismatch")),
                                             ("access", r.get("access_unreachable")),
                                             ("cred", r.get("cred_fallback")),
+                                            # A recorded expiry is only worth a column once it
+                                            # is near — or already past, which reads as negative
+                                            # days and must still fault rather than going quiet.
+                                            ("expiry", r.get("cred_expiry") is not None
+                                             and r["cred_expiry"] <= EXPIRY_WARN_DAYS),
                                             ("dup", r.get("name_collision"))) if bad)]
         t.add_row(*cells)
 
