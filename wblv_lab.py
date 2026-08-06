@@ -160,7 +160,11 @@ def _field(full, *names):
 KEEP_JSON = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
              "access", "check", "probe_ops", "reach", "reach_basis", "auth", "auth_detail",
              "item", "account", "endpoint", "endpoint_malformed", "access_unreachable",
-             "cred_fallback", "zone", "live_ip", "ip_drift", "platform", "name_collision",
+             # arp_seen says whether the router could see this member at all. Without it,
+             # ip_drift:null and zone:"" are ambiguous — a service legitimately has neither,
+             # and a machine whose ARP entry aged out has neither for a very different reason.
+             "cred_fallback", "zone", "arp_seen", "live_ip", "ip_drift", "platform",
+             "name_collision",
              # Both spellings are kept, not just the winner: a `name` fault says the two
              # disagree, and the consumer cannot act on that without seeing each of them.
              # cred_expiry is days remaining — negative means already expired.
@@ -387,7 +391,16 @@ def _member(item):
     # both the same way, because every item declares a short canonical name (365-01, nas-01).
     is_service = any(t.lower() == "service" for t in (full.get("tags") or []))
     declared = _field(full, "dns name").lower()
-    from_title = title.split("/")[0].strip().lower().removeprefix("wblv-")
+    # ⚠ This used to end `.removeprefix("wblv-")`, which was the last fact about THIS lab left in
+    # the code — a naming convention ("credential titles are prefixed wblv-") that the tool would
+    # have carried into any estate it was pointed at. Removed 2026-08-06.
+    #
+    # Nothing depends on it: `DNS Name` is authoritative and every item declares one, so this
+    # feeds only the fallback. Removing it also improves how the fallback FAILS. Before, an item
+    # with no declared name was silently corrected into something that happened to match the
+    # IPAM; now it derives the title as written, finds no IPAM entry, and says so. A member that
+    # cannot be identified should be visibly unidentified, not quietly guessed into place.
+    from_title = title.split("/")[0].strip().lower()
     derived = from_title if (is_service or not endpoint) else endpoint.split(".")[0].lower()
     # Tolerated rather than required: someone may reasonably write the FQDN here. The short name
     # is the identity either way, so both spellings resolve to the same member.
@@ -568,11 +581,31 @@ def classify(m):
     # the table had nothing left to add and a rename can no longer change how a host is read.
     proto, port = (m.get("scheme") or ""), m.get("url_port")
     _a = arp.get(inv.get("mac", ""), {})
+    # Did the router see this member at all. EVERYTHING below that reads from the ARP entry —
+    # zone, vendor, live_ip, ip_drift and the type-drift check — is UNMEASURED when this is
+    # false, which is a different statement from "measured and clean". Kept as its own field
+    # because that distinction is invisible in the values themselves: a blank zone and an
+    # absent ARP entry render identically, and so did a skipped drift check.
+    arp_seen = bool(_a)
     vendor = _a.get("manufacturer", "")
     zone = _a.get("intf_description", "")      # LAN / ADM / PLY, straight off the interface
     # The reservation says where it should be; ARP says where it is. Disagreement is the
     # lease that outlived the misconfig which created it — silent until someone looks.
-    ip_drift = bool(_a.get("ip") and inv.get("ip") and _a["ip"] != inv["ip"])
+    #
+    # ⚠ TRI-STATE, for exactly the reason REACH and AUTH are: with no ARP entry there is nothing
+    # to compare against, and a flat False asserted "checked, and no drift" about a host whose
+    # drift was never examined. That is the one claim this tool may not make.
+    #
+    # It is not a hypothetical. An ARP entry ages out on a QUIET host, and after a VLAN change
+    # the affected host is precisely the quiet one — so the check went silent exactly when it was
+    # load-bearing, and the lesson it exists to automate ("DHCP leases outlive the misconfig that
+    # created them") is the one it stopped enforcing. opn-01 is worse: it has no reservation of
+    # its own, so it has no MAC here and could never be checked at all, while reading clean.
+    #
+    # None = untested. The FAULT column treats it as falsy so a healthy table is unchanged, but
+    # --json can now tell "no drift" apart from "never looked".
+    ip_drift = (None if not (arp_seen and _a.get("ip") and inv.get("ip"))
+                else _a["ip"] != inv["ip"])
 
     declared = next((t.lower() for t in m["tags"] if t.lower() in TAG_TYPES), "")
     if not inv:
@@ -584,6 +617,11 @@ def classify(m):
     else:
         observed = ""                         # aged out of ARP — the wire cannot tell us
 
+    # ⚠ Same untested-vs-clean trap as ip_drift, and it shares the cause: with no ARP entry
+    # `observed` is "", so this reports no drift about a comparison that never happened. Left as
+    # a string rather than made tri-state — an empty drift string is already "nothing to say" —
+    # but `arp_seen` is what distinguishes the two, so a consumer can tell. Do not read a blank
+    # here as corroboration that the tag is right.
     drift = (f"tagged {declared}, but the wire says {observed}"
              if declared and observed and declared != observed else "")
     # A machine gets its URI rebuilt from the IPAM name, which is authoritative and may differ
@@ -594,7 +632,7 @@ def classify(m):
             "access": (m.get("website") or "") if (declared_svc and not inv) else
                       (f"{proto}://{inv.get('fqdn') or m['endpoint']}:{port}"
                        if port and (inv.get('fqdn') or m['endpoint']) else ""),
-            "vendor": vendor, "zone": zone,
+            "vendor": vendor, "zone": zone, "arp_seen": arp_seen,
             "live_ip": _a.get("ip", ""), "ip_drift": ip_drift,
             "type": declared or observed or "unclassified",
             "source": "tag" if declared else ("wire" if observed else "none"),
