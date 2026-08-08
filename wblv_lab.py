@@ -16,7 +16,7 @@ what its vault item declares it is. What remains in code is knowledge of vendors
 dialect each platform speaks, and where its endpoint lives — which changes when a vendor
 changes, not when Harry renames a box.
 """
-import os, sys, json, re, socket, subprocess, threading, time, datetime
+import os, sys, json, re, socket, subprocess, tempfile, threading, time, datetime
 try:
     import pexpect
 except ImportError:
@@ -691,32 +691,62 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
         try: c.close(force=True)
         except Exception: pass
 
-def aruba_probe(user, host, pw):
+def aruba_probe(user, host, pw, private_key=None):
     """ArubaOS does not accept a command as an SSH argument — it opens an interactive session
     with a banner and a keypress gate. Reaching the prompt IS the proof of login, so the probe
     stops there rather than running anything.
 
     The prompt character is the useful part: '>' is operator (show-only), '#' is manager. That
     reports the PRIVILEGE LEVEL as observed on the device, which is the read-only guarantee
-    demonstrated rather than assumed — and it would catch the account being promoted."""
+    demonstrated rather than assumed — and it would catch the account being promoted.
+
+    A key is used when the item carries one, because the switch may be set
+    `aaa authentication ssh login public-key`, under which passwords are refused outright.
+    The two paths are kept separate rather than blended: WHICH mechanism succeeded is part of
+    what is being reported, and a client left free to fall back would report a key login that
+    never happened. The detail line says which was exercised."""
     if pexpect is None:
         return None, "pexpect unavailable (run via uv, not bare python3)"
-    if not pw:
-        return None, "no password field on the 1Password item"
-    opts = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            "-o ConnectTimeout=12 -o PubkeyAuthentication=no "
-            "-o NumberOfPasswordPrompts=1 "
-            "-o PreferredAuthentications=password,keyboard-interactive")
-    note_op(f"ssh {user}@{host} -- prompt")
+    if not private_key and not pw:
+        return None, "no private key or password on the 1Password item"
+    base = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=12 ")
+    keyfile = None
+    if private_key:
+        # ssh reads identities from a file, so the key cannot be handed over any other way.
+        # The exposure is bounded instead of avoided: 0600, private temp dir, one probe's
+        # lifetime, removed in the finally even when the probe raises.
+        fd, keyfile = tempfile.mkstemp(prefix="wblv-probe-", suffix=".key")
+        os.write(fd, (private_key if private_key.endswith("\n") else private_key + "\n").encode())
+        os.close(fd)
+        os.chmod(keyfile, 0o600)
+        # IdentitiesOnly and IdentityAgent=none force THIS key. With an agent in reach ssh can
+        # authenticate on a different identity and the probe would report success for a
+        # credential it never tested — the same reason the password path pins
+        # PubkeyAuthentication=no.
+        #
+        # PubkeyAcceptedAlgorithms=+ssh-rsa is asked for HERE, per platform, never globally.
+        # Mocana SSH 6.3 does not send the server-sig-algs extension, so a modern client cannot
+        # learn that SHA-2 RSA signatures are acceptable and silently declines to OFFER an RSA
+        # key at all ("no mutual signature algorithm"). The key is never SENT rather than
+        # rejected — which looks identical to a bad credential from the far end.
+        opts = base + ("-o PasswordAuthentication=no -o PreferredAuthentications=publickey "
+                       "-o IdentitiesOnly=yes -o IdentityAgent=none "
+                       f"-o PubkeyAcceptedAlgorithms=+ssh-rsa -i {keyfile}")
+    else:
+        opts = base + ("-o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 "
+                       "-o PreferredAuthentications=password,keyboard-interactive")
+    note_op(f"ssh {user}@{host} -- prompt ({'key' if private_key else 'password'})")
     c = pexpect.spawn(f"ssh {opts} {user}@{host}", encoding="utf-8",
                       timeout=25, dimensions=(200, 400))
     try:
-        if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
-            return False, "no password prompt (SSH refused before auth)"
-        c.sendline(pw)
+        if not private_key:
+            if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
+                return False, "no password prompt (SSH refused before auth)"
+            c.sendline(pw)
         i = c.expect([r"[Pp]ress any key to continue", r"[A-Za-z0-9._\-]+[>#]",
-                      r"[Pp]assword:", r"nvalid", pexpect.EOF, pexpect.TIMEOUT])
-        if i in (2, 3):
+                      r"[Pp]assword:", r"nvalid", r"[Pp]ermission denied",
+                      pexpect.EOF, pexpect.TIMEOUT])
+        if i in (2, 3, 4):
             return False, "credential rejected"
         if i == 0:
             c.send("\r")
@@ -724,12 +754,17 @@ def aruba_probe(user, host, pw):
                 return False, "banner cleared but no prompt"
         prompt = (c.after or "").strip()
         level = "manager (#) — EXPECTED OPERATOR" if prompt.endswith("#") else "operator (>)"
-        return True, f"login ok, {level}"
+        return True, f"login ok by {'key' if private_key else 'password'}, {level}"
     finally:
         try:
             c.sendline("exit"); c.close(force=True)
         except Exception:
             pass
+        if keyfile:
+            try:
+                os.unlink(keyfile)
+            except OSError:
+                pass
 
 
 def auth_probe(r):
@@ -788,7 +823,11 @@ def auth_probe(r):
             # Prove the session is really established, not merely connected: the switch echoes
             # its own name, the shell echoes a token we chose.
             if r["platform"] == "aruba-switch":
-                return aruba_probe(u, host, pw)
+                # An SSH-key item carries no password at all, so the key is not an override of
+                # the password — it is the only credential the item has. Both are passed and
+                # the probe picks: a Login item still probes by password unchanged, which is
+                # what lets the two item formats coexist during a migration.
+                return aruba_probe(u, host, pw, c.get("private_key") or "")
             # A standalone TP-Link EAP answers SSH with an unprivileged BusyBox ash shell
             # (uid 1, cannot even write /dev/null), not the restricted CLI its GUI implies, so
             # the same echo test proves the session for real. Its host keys are ssh-rsa/ssh-dss
