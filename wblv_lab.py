@@ -16,7 +16,7 @@ what its vault item declares it is. What remains in code is knowledge of vendors
 dialect each platform speaks, and where its endpoint lives — which changes when a vendor
 changes, not when Harry renames a box.
 """
-import os, sys, json, re, socket, subprocess, threading, time, datetime
+import os, sys, json, re, socket, subprocess, tempfile, threading, time, datetime
 try:
     import pexpect
 except ImportError:
@@ -691,32 +691,62 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
         try: c.close(force=True)
         except Exception: pass
 
-def aruba_probe(user, host, pw):
+def aruba_probe(user, host, pw, private_key=None):
     """ArubaOS does not accept a command as an SSH argument — it opens an interactive session
     with a banner and a keypress gate. Reaching the prompt IS the proof of login, so the probe
     stops there rather than running anything.
 
     The prompt character is the useful part: '>' is operator (show-only), '#' is manager. That
     reports the PRIVILEGE LEVEL as observed on the device, which is the read-only guarantee
-    demonstrated rather than assumed — and it would catch the account being promoted."""
+    demonstrated rather than assumed — and it would catch the account being promoted.
+
+    A key is used when the item carries one, because the switch may be set
+    `aaa authentication ssh login public-key`, under which passwords are refused outright.
+    The two paths are kept separate rather than blended: WHICH mechanism succeeded is part of
+    what is being reported, and a client left free to fall back would report a key login that
+    never happened. The detail line says which was exercised."""
     if pexpect is None:
         return None, "pexpect unavailable (run via uv, not bare python3)"
-    if not pw:
-        return None, "no password field on the 1Password item"
-    opts = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
-            "-o ConnectTimeout=12 -o PubkeyAuthentication=no "
-            "-o NumberOfPasswordPrompts=1 "
-            "-o PreferredAuthentications=password,keyboard-interactive")
-    note_op(f"ssh {user}@{host} -- prompt")
+    if not private_key and not pw:
+        return None, "no private key or password on the 1Password item"
+    base = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=12 ")
+    keyfile = None
+    if private_key:
+        # ssh reads identities from a file, so the key cannot be handed over any other way.
+        # The exposure is bounded instead of avoided: 0600, private temp dir, one probe's
+        # lifetime, removed in the finally even when the probe raises.
+        fd, keyfile = tempfile.mkstemp(prefix="wblv-probe-", suffix=".key")
+        os.write(fd, (private_key if private_key.endswith("\n") else private_key + "\n").encode())
+        os.close(fd)
+        os.chmod(keyfile, 0o600)
+        # IdentitiesOnly and IdentityAgent=none force THIS key. With an agent in reach ssh can
+        # authenticate on a different identity and the probe would report success for a
+        # credential it never tested — the same reason the password path pins
+        # PubkeyAuthentication=no.
+        #
+        # PubkeyAcceptedAlgorithms=+ssh-rsa is asked for HERE, per platform, never globally.
+        # Mocana SSH 6.3 does not send the server-sig-algs extension, so a modern client cannot
+        # learn that SHA-2 RSA signatures are acceptable and silently declines to OFFER an RSA
+        # key at all ("no mutual signature algorithm"). The key is never SENT rather than
+        # rejected — which looks identical to a bad credential from the far end.
+        opts = base + ("-o PasswordAuthentication=no -o PreferredAuthentications=publickey "
+                       "-o IdentitiesOnly=yes -o IdentityAgent=none "
+                       f"-o PubkeyAcceptedAlgorithms=+ssh-rsa -i {keyfile}")
+    else:
+        opts = base + ("-o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 "
+                       "-o PreferredAuthentications=password,keyboard-interactive")
+    note_op(f"ssh {user}@{host} -- prompt ({'key' if private_key else 'password'})")
     c = pexpect.spawn(f"ssh {opts} {user}@{host}", encoding="utf-8",
                       timeout=25, dimensions=(200, 400))
     try:
-        if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
-            return False, "no password prompt (SSH refused before auth)"
-        c.sendline(pw)
+        if not private_key:
+            if c.expect([r"[Pp]assword:", pexpect.EOF, pexpect.TIMEOUT]) != 0:
+                return False, "no password prompt (SSH refused before auth)"
+            c.sendline(pw)
         i = c.expect([r"[Pp]ress any key to continue", r"[A-Za-z0-9._\-]+[>#]",
-                      r"[Pp]assword:", r"nvalid", pexpect.EOF, pexpect.TIMEOUT])
-        if i in (2, 3):
+                      r"[Pp]assword:", r"nvalid", r"[Pp]ermission denied",
+                      pexpect.EOF, pexpect.TIMEOUT])
+        if i in (2, 3, 4):
             return False, "credential rejected"
         if i == 0:
             c.send("\r")
@@ -724,12 +754,17 @@ def aruba_probe(user, host, pw):
                 return False, "banner cleared but no prompt"
         prompt = (c.after or "").strip()
         level = "manager (#) — EXPECTED OPERATOR" if prompt.endswith("#") else "operator (>)"
-        return True, f"login ok, {level}"
+        return True, f"login ok by {'key' if private_key else 'password'}, {level}"
     finally:
         try:
             c.sendline("exit"); c.close(force=True)
         except Exception:
             pass
+        if keyfile:
+            try:
+                os.unlink(keyfile)
+            except OSError:
+                pass
 
 
 def auth_probe(r):
@@ -788,7 +823,11 @@ def auth_probe(r):
             # Prove the session is really established, not merely connected: the switch echoes
             # its own name, the shell echoes a token we chose.
             if r["platform"] == "aruba-switch":
-                return aruba_probe(u, host, pw)
+                # An SSH-key item carries no password at all, so the key is not an override of
+                # the password — it is the only credential the item has. Both are passed and
+                # the probe picks: a Login item still probes by password unchanged, which is
+                # what lets the two item formats coexist during a migration.
+                return aruba_probe(u, host, pw, c.get("private_key") or "")
             # A standalone TP-Link EAP answers SSH with an unprivileged BusyBox ash shell
             # (uid 1, cannot even write /dev/null), not the restricted CLI its GUI implies, so
             # the same echo test proves the session for real. Its host keys are ssh-rsa/ssh-dss
@@ -853,6 +892,61 @@ def auth_probe(r):
             if devs is None:
                 return False, (j.get("message", "")[:60] or "API rejected the credential")
             return True, f"{len(devs)} devices, via {how}"
+        if r["platform"] == "jira":
+            # Basic auth with email:token — Atlassian's documented REST scheme, and the ONLY
+            # one that survives SSO. An account federated to Entra cannot present its IdP
+            # credentials to the API at all, which is precisely why the token exists and why
+            # mac-01 can reach Jira with no browser and no human in front of it. It also means
+            # a Conditional Access misfire that locks the browser out does NOT lock this out —
+            # worth knowing, not worth relying on.
+            #
+            # /myself is the cheapest READ that proves a token is live: it mutates nothing and
+            # returns the identity the token is acting as.
+            user, k = c.get("username") or "", c.get("api_key") or c.get("password") or ""
+            # Website, not DNS Name — see the reach branch. DNS Name is the canonical short
+            # name for a service; the API host is the Website URL.
+            host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
+            if not (user and k and host):
+                return None, "item needs username, API Key and a Website URL"
+            # Credentials go in on STDIN via --config, never in argv: an argument is readable
+            # by any local process from `ps` and lands verbatim in any spindump swept into a
+            # diagnostic bundle. Same invariant ssh_probe and the github branch state.
+            got, body = curl(f"https://{host}/rest/api/3/myself",
+                             "-H", "Accept: application/json", "--config", "-",
+                             stdin=f'user = "{user}:{k}"\n')
+            if not got:
+                return None, "no answer from the API"
+            try:
+                j = json.loads(body or "{}")
+            except ValueError:
+                return None, "unreadable answer from the API"
+            who = j.get("displayName") or j.get("emailAddress") or ""
+            if not who:
+                return False, "API rejected the token"
+            # Report the AUTHORITY the credential carries, not merely that it works — the same
+            # reason the github branch reads x-oauth-scopes. On the Free plan every account
+            # with product access is an admin, so a read-only credential is not achievable and
+            # this WILL read "admin". That is the point: the accepted gap stays visible every
+            # session instead of living only in the register. If it ever stops saying admin,
+            # something real changed.
+            #
+            # Best-effort and deliberately non-fatal: a working token whose permission lookup
+            # failed is still a working token, and must not be downgraded to a red AUTH.
+            grant = ""
+            try:
+                ok2, b2 = curl(f"https://{host}/rest/api/3/mypermissions"
+                               "?permissions=ADMINISTER,BROWSE_PROJECTS",
+                               "-H", "Accept: application/json", "--config", "-",
+                               stdin=f'user = "{user}:{k}"\n')
+                if ok2:
+                    p = (json.loads(b2 or "{}") or {}).get("permissions", {})
+                    if p.get("ADMINISTER", {}).get("havePermission"):
+                        grant = ", ADMIN"
+                    elif p.get("BROWSE_PROJECTS", {}).get("havePermission"):
+                        grant = ", browse only"
+            except Exception:
+                grant = ""      # untested authority is not the same as no authority
+            return True, f"{who}{grant}"
         if r["platform"] == "github":
             # A PAT authenticates as a bearer token, and /user is the cheapest READ that proves
             # one is live: it mutates nothing and costs one of 5,000 hourly calls. The item's
@@ -988,6 +1082,47 @@ def tenant_reach(r):
         err = f"{j.get('error') or ''} {j.get('error_description') or ''}".lower()
         if "invalid_tenant" in err or "aadsts90002" in err:
             return False, "tenant"
+        return None, ""
+    if r["platform"] == "jira":
+        # Atlassian Cloud publishes serverInfo with no credential, and it ECHOES the site's own
+        # baseUrl. Same shape as the Entra discovery document and the GitHub account probe: it
+        # needs no secret, it names OUR tenant rather than the vendor, and it discriminates.
+        # That keeps this row off "derived", so REACH stops depending on the token being valid.
+        #
+        # ⚠ That this endpoint answers at all is itself a standard #15 declared-exposure
+        # finding — "reachable without authenticating" is exactly what #15 asks to be
+        # enumerated and justified. It is Atlassian's default rather than a misconfiguration,
+        # and it is recorded in the jsm-01 runbook rather than silently relied upon here.
+        # ⚠ NOT dns_name. For a service, "DNS Name" carries the SHORT CANONICAL NAME
+        # (jsm-01, 365-01, git-01) — the vault's answer to "what is this called" — while the
+        # API host lives in the item's Website URL. Reading dns_name here builds
+        # https://jsm-01/... and fails in a way that looks like an unreachable tenant.
+        host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
+        if not host:
+            return None, ""
+        # The status code is requested explicitly because an HTTP error is a COMPLETED
+        # transfer: curl exits 0 on a 404, so REACHED alone cannot separate "this site does
+        # not exist" from "the answer was unreadable". Atlassian's 404 is an HTML page, not
+        # JSON, so without the code both collapse into a ValueError and a live-but-renamed
+        # site would report as untested forever.
+        got, body = curl(f"https://{host}/rest/api/3/serverInfo", "-w", "\n%{http_code}")
+        if not got:
+            return None, ""        # never reached it: says nothing about the tenant
+        body, _, code = body.rpartition("\n")
+        if code.strip() == "404":
+            # ONLY the specific site-not-found answer counts as absent. Throttling, a captive
+            # portal or a 5xx must stay None — a False here also suppresses the auth probe,
+            # and reporting a live site as gone while skipping the login proves nothing.
+            return False, "tenant"
+        try:
+            j = json.loads(body or "{}")
+        except ValueError:
+            return None, ""
+        base = (j.get("baseUrl") or "").lower()
+        if base:
+            # Compared, not merely present — a 200 describing somebody else's site would
+            # otherwise pass while proving nothing about ours.
+            return (host.lower() in base), "tenant"
         return None, ""
     if r["platform"] == "github":
         # GitHub publishes an account unauthenticated, and the account IS the tenant here.
