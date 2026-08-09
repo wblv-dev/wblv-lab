@@ -903,9 +903,11 @@ def auth_probe(r):
             # /myself is the cheapest READ that proves a token is live: it mutates nothing and
             # returns the identity the token is acting as.
             user, k = c.get("username") or "", c.get("api_key") or c.get("password") or ""
-            host = c.get("dns_name") or ""
+            # Website, not DNS Name — see the reach branch. DNS Name is the canonical short
+            # name for a service; the API host is the Website URL.
+            host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
             if not (user and k and host):
-                return None, "item needs username, API Key and DNS Name"
+                return None, "item needs username, API Key and a Website URL"
             # Credentials go in on STDIN via --config, never in argv: an argument is readable
             # by any local process from `ps` and lands verbatim in any spindump swept into a
             # diagnostic bundle. Same invariant ssh_probe and the github branch state.
@@ -1091,7 +1093,11 @@ def tenant_reach(r):
         # finding — "reachable without authenticating" is exactly what #15 asks to be
         # enumerated and justified. It is Atlassian's default rather than a misconfiguration,
         # and it is recorded in the jir-01 runbook rather than silently relied upon here.
-        host = c.get("dns_name") or ""
+        # ⚠ NOT dns_name. For a service, "DNS Name" carries the SHORT CANONICAL NAME
+        # (jir-01, 365-01, git-01) — the vault's answer to "what is this called" — while the
+        # API host lives in the item's Website URL. Reading dns_name here builds
+        # https://jir-01/... and fails in a way that looks like an unreachable tenant.
+        host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
         if not host:
             return None, ""
         # The status code is requested explicitly because an HTTP error is a COMPLETED
