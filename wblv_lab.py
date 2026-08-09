@@ -1092,11 +1092,11 @@ def tenant_reach(r):
         # ⚠ That this endpoint answers at all is itself a standard #15 declared-exposure
         # finding — "reachable without authenticating" is exactly what #15 asks to be
         # enumerated and justified. It is Atlassian's default rather than a misconfiguration,
-        # and it is recorded in the jir-01 runbook rather than silently relied upon here.
+        # and it is recorded in the jsm-01 runbook rather than silently relied upon here.
         # ⚠ NOT dns_name. For a service, "DNS Name" carries the SHORT CANONICAL NAME
-        # (jir-01, 365-01, git-01) — the vault's answer to "what is this called" — while the
+        # (jsm-01, 365-01, git-01) — the vault's answer to "what is this called" — while the
         # API host lives in the item's Website URL. Reading dns_name here builds
-        # https://jir-01/... and fails in a way that looks like an unreachable tenant.
+        # https://jsm-01/... and fails in a way that looks like an unreachable tenant.
         host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
         if not host:
             return None, ""
