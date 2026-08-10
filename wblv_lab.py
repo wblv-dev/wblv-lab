@@ -254,6 +254,17 @@ and run commands yourself, so the read-only limit lives in the host account."""
 if {"-h", "--help", "help"} & set(sys.argv[1:]):
     print(HELP); sys.exit(0)
 
+# An unrecognised flag used to be IGNORED, so `wblv-lab --breif` printed the full table and
+# said nothing -- you asked for one view and silently got another. That is the same defect the
+# whole tool is built against, sitting in its own argument parsing. Typos are the common case
+# and they are exactly when a confident wrong answer does the most damage.
+KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "-j",
+         "-h", "--help", "help"}
+_bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN]
+if _bad:
+    die(f"unknown option: {', '.join(_bad)}",
+        hint=f"known options: {' '.join(sorted(KNOWN - {'help'}))}   (wblv-lab -h)")
+
 WANT = ({"physical"} if "-p" in sys.argv else set()) | \
        ({"virtual"} if "-v" in sys.argv else set()) | \
        ({"service"} if "-s" in sys.argv else set())
@@ -1480,6 +1491,8 @@ def render(rows, meta):
           "green" if reachable == len(rows) else "yellow")
     field("Authenticated", f"{authed}/{tested}",
           "green" if tested and authed == tested else "yellow" if authed else "red")
+    _faulted = sum(1 for r in rows if faults_of(r))
+    field("Faults", _faulted, "red" if _faulted else "")
     field("Non-members", meta["off_directory"])
     # UNTESTED prints a dash, exactly as REACH and AUTH do, and means the same thing. A Jira
     # outage must never render as "0 open" — that reads as "all work is done".
@@ -1499,11 +1512,9 @@ def render(rows, meta):
         field("Members", " ".join(r["name"] for r in rows))
         bad = [r for r in rows
                if r["reach"] is not True or r["auth"] is not True or faults_of(r)]
-        con.print()
         if not bad:
-            con.print("[dim]All members reachable and authenticated, no faults. "
-                      "`wblv-lab` for addresses, access URIs and credentials.[/]")
-            return
+            return          # Faults/Reachable/Authenticated above already state it, measured
+        con.print()
         # Only what is not normal, with why. One line each: the full row is one command away
         # and the point here is that the exception is impossible to miss.
         con.print(f"[bold]NOT NORMAL — {len(bad)} of {len(rows)}[/]")
