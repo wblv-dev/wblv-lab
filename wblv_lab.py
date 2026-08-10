@@ -258,7 +258,7 @@ if {"-h", "--help", "help"} & set(sys.argv[1:]):
 # said nothing -- you asked for one view and silently got another. That is the same defect the
 # whole tool is built against, sitting in its own argument parsing. Typos are the common case
 # and they are exactly when a confident wrong answer does the most damage.
-KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "-j",
+KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks",
          "-h", "--help", "help"}
 _bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN]
 if _bad:
@@ -296,7 +296,9 @@ SHOW_TEST = "--test" in sys.argv
 # never ran" stay distinguishable; health is never implied by the absence of rows.
 SHOW_BRIEF = "--brief" in sys.argv
 
-SHOW_TASKS = bool({"--tasks", "-j"} & set(sys.argv[1:]))
+# No -j alias: it shadowed the obvious short form of --json and would have piped a Rich table
+# into a JSON parser, passing the unknown-option guard on the way.
+SHOW_TASKS = "--tasks" in sys.argv
 TASK_ID = next((a for a in sys.argv[1:] if not a.startswith("-")), None) if SHOW_TASKS else None
 
 
@@ -1320,10 +1322,20 @@ rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 # would read as "all work is done", which is the worst possible lie this tool could tell.
 LAB_PROJECT = "LAB"
 
+
+def esc(t):
+    """Jira text is user-supplied and Rich treats [...] as markup."""
+    from rich.markup import escape
+    return escape(str(t or ""))
+
 def jira_snapshot(rows):
     """One call, everything computed here. Returns None if there is no jira member or the
     API did not answer; a dict otherwise. Blocked-ness is derived from real issue links, not
     from prose, which is the whole reason task state left markdown."""
+    # Deliberately given the UNFILTERED member list. Fed the -p/-v view's rows, jsm-01 simply
+    # is not there, and the tool then reports "jsm-01 did not answer" -- stating as measured
+    # fact that a probe failed when it was never sent. off_directory is computed before the
+    # filter for exactly this reason.
     m = next((r for r in rows if r["platform"] == "jira"), None)
     if not m:
         return None
@@ -1332,6 +1344,11 @@ def jira_snapshot(rows):
     host = re.sub(r"^[a-z]+://", "", (m.get("endpoint") or "")).split("/")[0].strip()
     if not (user and k and host):
         return None
+    # note_op attributes to _CUR.id, which probe() sets on its pool workers. This runs on the
+    # main thread after the pool has joined, so without this its calls record NOTHING and
+    # --check/probe_ops under-report what the run actually contacted — in a tool whose stated
+    # contract is that probe_ops describes what happened, not what the code intends to do.
+    _CUR.id = m["id"]
     # maxResults is bounded: a runaway project must not turn a session hook into a paginator.
     # If it is ever hit the count is a floor, and truncated says so rather than lying quietly.
     # WORK is hierarchyLevel 0. Epics (1) are containers and sub-tasks (-1) would double-count
@@ -1347,7 +1364,10 @@ def jira_snapshot(rows):
     except ValueError:
         return None
     if not work_ids:
-        return None                      # no work types is not the same as no work
+        # The transfer completed and the answer had no work types in it: that is the far end
+        # saying no (revoked token, renamed project), not a probe that never ran. curl()'s own
+        # contract is "no answer is None, never False" -- so this must be False.
+        return False
     only = f"issuetype in ({', '.join(work_ids)})"
 
     # Fetch OPEN work only. Done issues never leave a project, so a whole-project fetch is
@@ -1371,7 +1391,7 @@ def jira_snapshot(rows):
         return None
     issues = j.get("issues")
     if issues is None:
-        return None                      # the API answered, but not with a result set
+        return False                     # answered, but not with a result set: a refusal
 
     # Done is counted, never listed: the number is the only part anyone reads, and counting it
     # costs one call instead of paging through every task ever finished.
@@ -1386,7 +1406,11 @@ def jira_snapshot(rows):
         done_n = None                    # untested, and it says so rather than showing 0
 
     out = {"open": 0, "prog": 0, "done": done_n, "ready": [], "blocked": [], "mine": [],
-           "truncated": len(issues) >= 200, "host": host}
+           # The endpoint is token-paginated and trims pages by RESPONSE SIZE, so a short page
+           # is not evidence of a complete set. Inferring completeness from len() turns a floor
+           # into a confident total with the warning silently off.
+           "truncated": bool(j.get("nextPageToken")) or j.get("isLast") is False,
+           "host": host}
     for i in issues:
         f = i["fields"]
         cat = f["status"]["statusCategory"]["key"]
@@ -1396,13 +1420,21 @@ def jira_snapshot(rows):
         # "is blocked by" pointing at something not yet done. A link to a CLOSED blocker is
         # not a blocker, which is the difference between a dependency graph and a list of
         # references — and the reason this is computed rather than stored.
-        waits = [l["outwardIssue"] for l in (f.get("issuelinks") or [])
-                 if l["type"]["inward"] == "is blocked by" and l.get("outwardIssue")
-                 and l["outwardIssue"]["fields"]["status"]["statusCategory"]["key"] != "done"]
-        row = {"id": labid, "key": i["key"], "hands": hands,
-               "scope": ((f.get("parent") or {}).get("fields") or {}).get("summary", "").split(" —")[0],
+        # An issue carries inwardIssue for the end it IS BLOCKED BY, and outwardIssue for the
+        # end it blocks. type["inward"] is the same string on BOTH directions, so testing it
+        # alone keeps every Blocks link; the side that is present is what carries the direction.
+        # Read the wrong side and the graph inverts -- and it inverts into something plausible,
+        # which is why it survived a review of the rendered output. Verified against raw links.
+        waits = [l["inwardIssue"] for l in (f.get("issuelinks") or [])
+                 if l["type"]["inward"] == "is blocked by" and l.get("inwardIssue")
+                 and l["inwardIssue"]["fields"]["status"]["statusCategory"]["key"] != "done"]
+        # Jira text is user-supplied and goes through a markup renderer: a summary containing
+        # "[ADM]" would be swallowed as an unknown style and "[/]" raises. A rendered value that
+        # differs from the measured value breaks the rule that every glyph maps to a measurement.
+        row = {"id": esc(labid), "key": i["key"], "hands": hands,
+               "scope": esc(((f.get("parent") or {}).get("fields") or {}).get("summary", "").split(" —")[0]),
                "phase": ((f.get("fixVersions") or [{}])[0] or {}).get("name", "")[:2],
-               "summary": f["summary"].split("— ", 1)[-1],
+               "summary": esc(f["summary"].split("— ", 1)[-1]),
                "waits": [w["key"] for w in waits]}
         if waits:
             out["blocked"].append(row)
@@ -1436,7 +1468,21 @@ def faults_of(r):
                              ("dup", r.get("name_collision"))) if bad]
 
 
-TASKS = jira_snapshot(rows)
+# Lazy and guarded. Lazy because --json carries no task fields, so paying three serialized
+# round-trips for data the output cannot hold is pure latency on a hook with a 60s budget and a
+# member count about to grow. Guarded because every other probe is wrapped per member: unwrapped,
+# one unexpected Jira payload takes the WHOLE directory down with a traceback, and reach/auth for
+# every host disappears because of a ticket link.
+_TASKS_CACHE = []
+
+
+def tasks_snapshot():
+    if not _TASKS_CACHE:
+        try:
+            _TASKS_CACHE.append(jira_snapshot(_all))   # _all, not rows: see below
+        except Exception:
+            _TASKS_CACHE.append(None)                  # untested, never a traceback
+    return _TASKS_CACHE[0]
 
 
 def render(rows, meta):
@@ -1496,8 +1542,20 @@ def render(rows, meta):
     field("Non-members", meta["off_directory"])
     # UNTESTED prints a dash, exactly as REACH and AUTH do, and means the same thing. A Jira
     # outage must never render as "0 open" — that reads as "all work is done".
+    TASKS = tasks_snapshot()
+    # probe() copies check/probe_ops out of PROBE_OPS when its worker finishes, and the task
+    # calls happen later on this thread — so the row still describes the run as it was BEFORE
+    # them. Re-read it, or --check reports five operations on a run that made eight. This is a
+    # symptom of the task snapshot living outside the probe pool; the structural fix is to make
+    # it part of jsm-01's own probe.
+    for _r in rows:
+        if _r.get("platform") == "jira":
+            _r["probe_ops"] = list(PROBE_OPS.get(_r["id"]) or [])
+            _r["check"] = describe_check(_r)
     if TASKS is None:
         field("Tasks", "-", "dim")
+    elif TASKS is False:
+        field("Tasks", "far end refused", "red")
     else:
         _done = TASKS["done"]
         field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · "
@@ -1531,14 +1589,21 @@ def render(rows, meta):
 
     if SHOW_TASKS:
         if TASKS is None:
-            con.print("[dim]tasks UNTESTED — jsm-01 did not answer. Not the same as no tasks.[/]")
+            con.print("[dim]tasks UNTESTED — no answer from jsm-01. Not the same as no tasks.[/]")
+            return
+        if TASKS is False:
+            con.print("[red]tasks FAILED — jsm-01 answered and refused. Check the token, the "
+                      "project key, and whether the credential still browses LAB.[/]")
             return
         DASH = "[grey35]-[/]"
         if TASK_ID:
             # One record reads as fields, not as a one-row table — the same shape the header
             # uses, for the same reason: there is nothing to compare it against.
+            # Accepts the Jira key too: this same view prints `Jira: LAB-6`, and WAITS ON can
+            # print a raw key whenever the blocker sits outside the fetched open set. Rejecting
+            # the identifier the tool just showed you is its own small betrayal.
             hit = [r for r in TASKS["ready"] + TASKS["blocked"]
-                   if r["id"].lower() == TASK_ID.lower()]
+                   if TASK_ID.lower() in (r["id"].lower(), r["key"].lower())]
             if not hit:
                 con.print(f"[dim]no OPEN task with Lab ID {TASK_ID}. It may be done, or the id may be"
                           f" wrong — those are different, so check before assuming.[/]")
