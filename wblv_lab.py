@@ -195,6 +195,8 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab --mac        add the MAC column
   wblv-lab --check      swap ACCESS for what each probe actually did
   wblv-lab --json       machine-readable
+  wblv-lab --tasks      swap the member table for open work (jsm-01)
+  wblv-lab --tasks 1a.5 resolve one task by its Lab ID
   wblv-lab --test       every view in turn, from a single probe pass
   wblv-lab -h           this text
 
@@ -1381,6 +1383,14 @@ def render(rows, meta):
         v = f"[{style}]{value}[/]" if style else str(value)
         con.print(f"[dim]{label + ':':<15}[/]{v}")
 
+    # Time leads because everything under it is a measurement, and a measurement without a
+    # timestamp is a claim (#14). It is also the answer to "what is now" for anything reading
+    # this output — a session hook that has to guess the date will fabricate one, and a
+    # fabricated timestamp is indistinguishable from a measured one once written down.
+    # UTC first because the estate standard is UTC; local in brackets because Harry is not.
+    _utc = time.gmtime(); _loc = time.localtime()
+    field("Time", time.strftime("%Y-%m-%d %H:%M:%S UTC", _utc)
+                  + f"  [dim](local {time.strftime('%H:%M %Z', _loc)})[/]")
     field("Vault", meta["vault"])
     field("Source", meta["ipam_source"])
     field("Probing from", f"{meta['prober']} ({meta['prober_zone']})"
@@ -1416,30 +1426,52 @@ def render(rows, meta):
         if TASKS is None:
             con.print("[dim]tasks UNTESTED — jsm-01 did not answer. Not the same as no tasks.[/]")
             return
+        DASH = "[grey35]-[/]"
         if TASK_ID:
+            # One record reads as fields, not as a one-row table — the same shape the header
+            # uses, for the same reason: there is nothing to compare it against.
             hit = [r for r in TASKS["ready"] + TASKS["blocked"]
                    if r["id"].lower() == TASK_ID.lower()]
             if not hit:
-                con.print(f"[dim]no OPEN task with Lab ID {TASK_ID}. It may be done, or the id may be wrong —"
-                          f" those are different, so check before assuming.[/]")
+                con.print(f"[dim]no OPEN task with Lab ID {TASK_ID}. It may be done, or the id may be"
+                          f" wrong — those are different, so check before assuming.[/]")
                 return
             for r in hit:
                 con.print(f"[bold]{r['id']}[/]  {r['summary']}")
-                con.print(f"[dim]{'scope:':<10}[/]{r['scope'] or '-'}   [dim]phase:[/] {r['phase'] or '-'}"
-                          f"   [dim]hands:[/] {r['hands']}   [dim]jira:[/] {r['key']}")
-                if r["waits"]:
-                    con.print(f"[yellow]{'blocked by:':<11}[/]{', '.join(r['waits'])}")
+                field("Scope", r["scope"] or DASH)
+                field("Phase", r["phase"] or DASH)
+                field("Hands", r["hands"])
+                field("Jira", r["key"])
+                field("Waits on", ", ".join(r["waits"]) if r["waits"] else DASH,
+                      "yellow" if r["waits"] else "")
             return
-        def block(title, items, style=""):
-            con.print(f"[bold]{title}[/] — {len(items)}")
-            for r in sorted(items, key=lambda x: (x["phase"], x["id"])):
-                w = f"  [yellow]waits on {', '.join(r['waits'])}[/]" if r["waits"] else ""
-                con.print(f"  [{style}]{r['id']:<7}[/]{r['phase']:<3} {r['scope'][:8]:<9}"
-                          f"{r['hands']:<7}{r['summary'][:54]}{w}")
-            con.print()
-        block("READY NOW", TASKS["ready"], "bold")
-        block("BLOCKED", TASKS["blocked"], "dim")
-        block("DELEGABLE TO CLAUDE", TASKS["mine"], "cyan")
+        # One table, state in a column — the member table's shape. Splitting ready and blocked
+        # into separate blocks made STATE invisible as a value you can scan and compare, and
+        # DELEGABLE was a third rendering of rows already on screen. HANDS answers it instead.
+        t = Table(box=box.SIMPLE, show_edge=False, header_style="bold", border_style="grey35",
+                  pad_edge=False, padding=(0, 1))
+        t.add_column("TASK", style="bold", no_wrap=True)
+        t.add_column("PH", no_wrap=True)
+        t.add_column("SCOPE", no_wrap=True)
+        t.add_column("HANDS", no_wrap=True)
+        t.add_column("STATE", justify="center", no_wrap=True, min_width=7)
+        # Blank unless something is actually holding this up, so the absence of a blocker is as
+        # visible as its presence — the same reasoning as FAULT.
+        t.add_column("WAITS ON", style="yellow", no_wrap=True)
+        t.add_column("SUMMARY", style="cyan")
+        HANDS = {"Claude": "cyan", "Harry": "default", "Either": "magenta"}
+        for r in sorted(TASKS["ready"], key=lambda x: (x["phase"], x["id"])) + \
+                 sorted(TASKS["blocked"], key=lambda x: (x["phase"], x["id"])):
+            t.add_row(r["id"], r["phase"] or DASH, r["scope"] or DASH,
+                      f"[{HANDS.get(r['hands'],'yellow')}]{r['hands']}[/]",
+                      "[green]ready[/]" if not r["waits"] else "[yellow]blocked[/]",
+                      ", ".join(r["waits"]) or "",
+                      r["summary"])
+        probe = Console(width=10_000, no_color=True)
+        natural = Measurement.get(probe, probe.options, t).maximum
+        out = con if natural <= con.width else Console(width=natural, highlight=False)
+        rule = "[grey35]" + "─" * natural + "[/]"
+        out.print(rule); out.print(t); out.print(rule)
         return
 
     # SIMPLE without an edge is the only box that starts at column 0 — every bordered style
@@ -1557,6 +1589,13 @@ if __name__ == "__main__":
             SHOW_MAC, SHOW_CHECK = mac, chk
             print(f"\n{'=' * 78}\n$ {label}\n{'=' * 78}")
             render([r for r in shown if not want or r["type"] in want], meta)
+        # --tasks swaps the table, so it cannot ride the loop above: the loop varies which
+        # MEMBERS are shown, and this varies what the table IS. Same single probe pass.
+        SHOW_MAC = SHOW_CHECK = False
+        SHOW_TASKS = True
+        print(f"\n{'=' * 78}\n$ wblv-lab --tasks\n{'=' * 78}")
+        render(shown, meta)
+        SHOW_TASKS = False
         print(f"\n{'=' * 78}\n$ wblv-lab --json\n{'=' * 78}")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON}
                                               for r in shown]}, indent=2))
