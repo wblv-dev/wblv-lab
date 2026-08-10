@@ -941,18 +941,31 @@ def auth_probe(r):
             #
             # Best-effort and deliberately non-fatal: a working token whose permission lookup
             # failed is still a working token, and must not be downgraded to a red AUTH.
+            # Enumerate what the credential can DO, not a single word for it. Reporting
+            # "ADMIN" collapsed a set into a label and overstated it: this token holds
+            # ADMINISTER and EDIT and CREATE but NOT DELETE, so "ADMIN" read as "can do
+            # anything" while a delete was refused. A credential description that is wider
+            # than the credential is the same defect as one that is narrower.
+            #
+            # Best-effort and deliberately non-fatal: a working token whose permission lookup
+            # failed is still a working token and must not be downgraded to a red AUTH.
             grant = ""
             try:
                 ok2, b2 = curl(f"https://{host}/rest/api/3/mypermissions"
-                               "?permissions=ADMINISTER,BROWSE_PROJECTS",
+                               "?permissions=BROWSE_PROJECTS,CREATE_ISSUES,EDIT_ISSUES,"
+                               "DELETE_ISSUES,ADMINISTER",
                                "-H", "Accept: application/json", "--config", "-",
                                stdin=f'user = "{user}:{k}"\n')
                 if ok2:
-                    p = (json.loads(b2 or "{}") or {}).get("permissions", {})
-                    if p.get("ADMINISTER", {}).get("havePermission"):
-                        grant = ", ADMIN"
-                    elif p.get("BROWSE_PROJECTS", {}).get("havePermission"):
-                        grant = ", browse only"
+                    P = (json.loads(b2 or "{}") or {}).get("permissions", {})
+                    def has(x): return bool(P.get(x, {}).get("havePermission"))
+                    held = [n for n, key in (("admin", "ADMINISTER"), ("create", "CREATE_ISSUES"),
+                                             ("edit", "EDIT_ISSUES"), ("delete", "DELETE_ISSUES"))
+                            if has(key)]
+                    if held:
+                        grant = ", " + "+".join(held)
+                    elif has("BROWSE_PROJECTS"):
+                        grant = ", read-only"      # the goal; say so when it is true
             except Exception:
                 grant = ""      # untested authority is not the same as no authority
             return True, f"{who}{grant}"
@@ -1303,8 +1316,30 @@ def jira_snapshot(rows):
         return None
     # maxResults is bounded: a runaway project must not turn a session hook into a paginator.
     # If it is ever hit the count is a floor, and truncated says so rather than lying quietly.
+    # WORK is hierarchyLevel 0. Epics (1) are containers and sub-tasks (-1) would double-count
+    # their parent. Filtered by TYPE ID, not by name: "issuetype != Epic" silently starts
+    # counting epics as work the day somebody renames the type, and nothing would say so.
+    got, body = curl(f"https://{host}/rest/api/3/project/{LAB_PROJECT}",
+                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
+    if not got:
+        return None
+    try:
+        work_ids = [t["id"] for t in json.loads(body or "{}").get("issueTypes", [])
+                    if t.get("hierarchyLevel") == 0]
+    except ValueError:
+        return None
+    if not work_ids:
+        return None                      # no work types is not the same as no work
+    only = f"issuetype in ({', '.join(work_ids)})"
+
+    # Fetch OPEN work only. Done issues never leave a project, so a whole-project fetch is
+    # bounded by HISTORY rather than by outstanding work — it would have crossed any cap on
+    # completed tasks alone, and the counts would then have quietly meant "open among the
+    # first N". Open work is the thing that is actually bounded.
     got, body = curl(f"https://{host}/rest/api/3/search/jql", "-G",
-                     "--data-urlencode", f"jql=project = {LAB_PROJECT} ORDER BY created ASC",
+                     "--data-urlencode",
+                     f"jql=project = {LAB_PROJECT} AND {only} AND statusCategory != Done"
+                     " ORDER BY created ASC",
                      "--data-urlencode", "maxResults=200",
                      "--data-urlencode", "fields=summary,status,issuetype,issuelinks,parent,"
                                          "fixVersions,customfield_10042,customfield_10045,"
@@ -1319,18 +1354,26 @@ def jira_snapshot(rows):
     issues = j.get("issues")
     if issues is None:
         return None                      # the API answered, but not with a result set
-    out = {"open": 0, "prog": 0, "done": 0, "ready": [], "blocked": [], "mine": [],
+
+    # Done is counted, never listed: the number is the only part anyone reads, and counting it
+    # costs one call instead of paging through every task ever finished.
+    dgot, dbody = curl(f"https://{host}/rest/api/3/search/approximate-count",
+                       "-X", "POST", "-H", "Content-Type: application/json",
+                       "-d", json.dumps({"jql": f"project = {LAB_PROJECT} AND {only}"
+                                                " AND statusCategory = Done"}),
+                       "--config", "-", stdin=f'user = "{user}:{k}"\n')
+    try:
+        done_n = json.loads(dbody or "{}").get("count") if dgot else None
+    except ValueError:
+        done_n = None                    # untested, and it says so rather than showing 0
+
+    out = {"open": 0, "prog": 0, "done": done_n, "ready": [], "blocked": [], "mine": [],
            "truncated": len(issues) >= 200, "host": host}
     for i in issues:
         f = i["fields"]
-        if (f.get("issuetype") or {}).get("name") == "Epic":
-            continue                     # epics are containers, not work
         cat = f["status"]["statusCategory"]["key"]
         labid = f.get("customfield_10042") or i["key"]
         hands = (f.get("customfield_10045") or {}).get("value") or "-"
-        if cat == "done":
-            out["done"] += 1
-            continue
         out["prog" if cat == "indeterminate" else "open"] += 1
         # "is blocked by" pointing at something not yet done. A link to a CLOSED blocker is
         # not a blocker, which is the difference between a dependency graph and a list of
@@ -1418,7 +1461,9 @@ def render(rows, meta):
     if TASKS is None:
         field("Tasks", "-", "dim")
     else:
-        field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · {TASKS['done']} done"
+        _done = TASKS["done"]
+        field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · "
+                       + (f"{_done} done" if _done is not None else "[dim]- done[/]")
                        + ("  [yellow](truncated at 200)[/]" if TASKS["truncated"] else ""))
     con.print()
 
