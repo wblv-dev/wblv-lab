@@ -272,6 +272,13 @@ SHOW_CHECK = "--check" in sys.argv
 # without running the probes nine times.
 SHOW_TEST = "--test" in sys.argv
 
+# Swaps the member table for the task table — same slot, same reasoning as --check. "What is
+# alive" and "what should I do next" are different questions; the default answers the first.
+# An argument after the flag resolves ONE Lab ID, which is the lookup that would otherwise be
+# six lines of curl assembled by hand every time.
+SHOW_TASKS = bool({"--tasks", "-j"} & set(sys.argv[1:]))
+TASK_ID = next((a for a in sys.argv[1:] if not a.startswith("-")), None) if SHOW_TASKS else None
+
 
 # --- 1Password substrate ------------------------------------------------------------------
 # Prove the token and 1P are usable ONCE, up front. Otherwise a single substrate fault shows
@@ -1270,6 +1277,87 @@ with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; 
     rows = list(ex.map(probe, _classified))
 rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 
+# ---------------------------------------------------------------- Jira task snapshot -----
+# jsm-01 is a member like any other, and its task state is member DETAIL in the same way
+# auth_detail is: a fact about that member, read live, stored nowhere. The default view shows
+# only the counts, because "is the lab healthy" and "what should I do next" are different
+# questions and the second one is asked with --tasks.
+#
+# ⚠ Returns None for UNTESTED and never a zeroed dict. A Jira outage that reported "0 open"
+# would read as "all work is done", which is the worst possible lie this tool could tell.
+LAB_PROJECT = "LAB"
+
+def jira_snapshot(rows):
+    """One call, everything computed here. Returns None if there is no jira member or the
+    API did not answer; a dict otherwise. Blocked-ness is derived from real issue links, not
+    from prose, which is the whole reason task state left markdown."""
+    m = next((r for r in rows if r["platform"] == "jira"), None)
+    if not m:
+        return None
+    c = CREDS.get(m["id"], {})
+    user, k = c.get("username") or "", c.get("api_key") or c.get("password") or ""
+    host = re.sub(r"^[a-z]+://", "", (m.get("endpoint") or "")).split("/")[0].strip()
+    if not (user and k and host):
+        return None
+    # maxResults is bounded: a runaway project must not turn a session hook into a paginator.
+    # If it is ever hit the count is a floor, and truncated says so rather than lying quietly.
+    got, body = curl(f"https://{host}/rest/api/3/search/jql", "-G",
+                     "--data-urlencode", f"jql=project = {LAB_PROJECT} ORDER BY created ASC",
+                     "--data-urlencode", "maxResults=200",
+                     "--data-urlencode", "fields=summary,status,issuetype,issuelinks,parent,"
+                                         "fixVersions,customfield_10042,customfield_10045,"
+                                         "customfield_10046",
+                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
+    if not got:
+        return None
+    try:
+        j = json.loads(body or "{}")
+    except ValueError:
+        return None
+    issues = j.get("issues")
+    if issues is None:
+        return None                      # the API answered, but not with a result set
+    out = {"open": 0, "prog": 0, "done": 0, "ready": [], "blocked": [], "mine": [],
+           "truncated": len(issues) >= 200, "host": host}
+    for i in issues:
+        f = i["fields"]
+        if (f.get("issuetype") or {}).get("name") == "Epic":
+            continue                     # epics are containers, not work
+        cat = f["status"]["statusCategory"]["key"]
+        labid = f.get("customfield_10042") or i["key"]
+        hands = (f.get("customfield_10045") or {}).get("value") or "-"
+        if cat == "done":
+            out["done"] += 1
+            continue
+        out["prog" if cat == "indeterminate" else "open"] += 1
+        # "is blocked by" pointing at something not yet done. A link to a CLOSED blocker is
+        # not a blocker, which is the difference between a dependency graph and a list of
+        # references — and the reason this is computed rather than stored.
+        waits = [l["outwardIssue"] for l in (f.get("issuelinks") or [])
+                 if l["type"]["inward"] == "is blocked by" and l.get("outwardIssue")
+                 and l["outwardIssue"]["fields"]["status"]["statusCategory"]["key"] != "done"]
+        row = {"id": labid, "key": i["key"], "hands": hands,
+               "scope": ((f.get("parent") or {}).get("fields") or {}).get("summary", "").split(" —")[0],
+               "phase": ((f.get("fixVersions") or [{}])[0] or {}).get("name", "")[:2],
+               "summary": f["summary"].split("— ", 1)[-1],
+               "waits": [w["key"] for w in waits]}
+        if waits:
+            out["blocked"].append(row)
+        else:
+            out["ready"].append(row)
+            if hands == "Claude":
+                out["mine"].append(row)
+    # Blocked rows name Jira keys; the vault speaks Lab IDs. Translate, because a runbook that
+    # says "1e.1" and a hook that says "LAB-6" do not obviously refer to the same thing.
+    key2id = {i["key"]: (i["fields"].get("customfield_10042") or i["key"]) for i in issues}
+    for r in out["blocked"]:
+        r["waits"] = [key2id.get(k, k) for k in r["waits"]]
+    return out
+
+
+TASKS = jira_snapshot(rows)
+
+
 def render(rows, meta):
     """A table for humans. Colour encodes STATE and nothing else — green up, red down, dim
     untested. Every glyph maps to a measured value; none of it is commentary.
@@ -1315,7 +1403,44 @@ def render(rows, meta):
     field("Authenticated", f"{authed}/{tested}",
           "green" if tested and authed == tested else "yellow" if authed else "red")
     field("Non-members", meta["off_directory"])
+    # UNTESTED prints a dash, exactly as REACH and AUTH do, and means the same thing. A Jira
+    # outage must never render as "0 open" — that reads as "all work is done".
+    if TASKS is None:
+        field("Tasks", "-", "dim")
+    else:
+        field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · {TASKS['done']} done"
+                       + ("  [yellow](truncated at 200)[/]" if TASKS["truncated"] else ""))
     con.print()
+
+    if SHOW_TASKS:
+        if TASKS is None:
+            con.print("[dim]tasks UNTESTED — jsm-01 did not answer. Not the same as no tasks.[/]")
+            return
+        if TASK_ID:
+            hit = [r for r in TASKS["ready"] + TASKS["blocked"]
+                   if r["id"].lower() == TASK_ID.lower()]
+            if not hit:
+                con.print(f"[dim]no OPEN task with Lab ID {TASK_ID}. It may be done, or the id may be wrong —"
+                          f" those are different, so check before assuming.[/]")
+                return
+            for r in hit:
+                con.print(f"[bold]{r['id']}[/]  {r['summary']}")
+                con.print(f"[dim]{'scope:':<10}[/]{r['scope'] or '-'}   [dim]phase:[/] {r['phase'] or '-'}"
+                          f"   [dim]hands:[/] {r['hands']}   [dim]jira:[/] {r['key']}")
+                if r["waits"]:
+                    con.print(f"[yellow]{'blocked by:':<11}[/]{', '.join(r['waits'])}")
+            return
+        def block(title, items, style=""):
+            con.print(f"[bold]{title}[/] — {len(items)}")
+            for r in sorted(items, key=lambda x: (x["phase"], x["id"])):
+                w = f"  [yellow]waits on {', '.join(r['waits'])}[/]" if r["waits"] else ""
+                con.print(f"  [{style}]{r['id']:<7}[/]{r['phase']:<3} {r['scope'][:8]:<9}"
+                          f"{r['hands']:<7}{r['summary'][:54]}{w}")
+            con.print()
+        block("READY NOW", TASKS["ready"], "bold")
+        block("BLOCKED", TASKS["blocked"], "dim")
+        block("DELEGABLE TO CLAUDE", TASKS["mine"], "cyan")
+        return
 
     # SIMPLE without an edge is the only box that starts at column 0 — every bordered style
     # reserves a blank edge column and indents the whole block by one. It gives the rule under
