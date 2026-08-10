@@ -195,6 +195,7 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab --mac        add the MAC column
   wblv-lab --check      swap ACCESS for what each probe actually did
   wblv-lab --json       machine-readable
+  wblv-lab --brief      counts + Members + only what is NOT normal (what the hook reads)
   wblv-lab --tasks      swap the member table for open work (jsm-01)
   wblv-lab --tasks 1a.5 resolve one task by its Lab ID
   wblv-lab --test       every view in turn, from a single probe pass
@@ -278,6 +279,12 @@ SHOW_TEST = "--test" in sys.argv
 # alive" and "what should I do next" are different questions; the default answers the first.
 # An argument after the flag resolves ONE Lab ID, which is the lookup that would otherwise be
 # six lines of curl assembled by hand every time.
+# Exceptions only. Ten rows that all say "fine" carry one bit between them, and a wall of
+# green teaches the reader to skim -- which is how a silently truncated session hook went
+# unnoticed for days. The counts still ASSERT health positively, so "all fine" and "the probe
+# never ran" stay distinguishable; health is never implied by the absence of rows.
+SHOW_BRIEF = "--brief" in sys.argv
+
 SHOW_TASKS = bool({"--tasks", "-j"} & set(sys.argv[1:]))
 TASK_ID = next((a for a in sys.argv[1:] if not a.startswith("-")), None) if SHOW_TASKS else None
 
@@ -1400,6 +1407,24 @@ def jira_snapshot(rows):
     return out
 
 
+def faults_of(r):
+    """The FAULT column, as data. One implementation because two would drift: --brief once
+    tested a key that did not exist, so its fault branch could never fire -- a check that
+    cannot trigger is indistinguishable from a clean estate."""
+    return [f for f, bad in (("url", r.get("endpoint_malformed")),
+                             ("ip", r.get("ip_drift")),
+                             ("tag", r.get("type_drift")),
+                             ("name", r.get("name_mismatch")),
+                             ("access", r.get("access_unreachable")),
+                             ("cred", r.get("cred_fallback")),
+                             # A recorded expiry is only worth a column once it is near -- or
+                             # already past, which reads as negative days and must still fault
+                             # rather than going quiet.
+                             ("expiry", r.get("cred_expiry") is not None
+                              and r["cred_expiry"] <= EXPIRY_WARN_DAYS),
+                             ("dup", r.get("name_collision"))) if bad]
+
+
 TASKS = jira_snapshot(rows)
 
 
@@ -1466,6 +1491,32 @@ def render(rows, meta):
                        + (f"{_done} done" if _done is not None else "[dim]- done[/]")
                        + ("  [yellow](truncated at 200)[/]" if TASKS["truncated"] else ""))
     con.print()
+
+    if SHOW_BRIEF:
+        # Named explicitly rather than scraped from a column: the hook hands this list to the
+        # to-do generator so it does not make its own probe, and a consumer that has to parse
+        # a rendered table breaks the moment the table changes shape.
+        field("Members", " ".join(r["name"] for r in rows))
+        bad = [r for r in rows
+               if r["reach"] is not True or r["auth"] is not True or faults_of(r)]
+        con.print()
+        if not bad:
+            con.print("[dim]All members reachable and authenticated, no faults. "
+                      "`wblv-lab` for addresses, access URIs and credentials.[/]")
+            return
+        # Only what is not normal, with why. One line each: the full row is one command away
+        # and the point here is that the exception is impossible to miss.
+        con.print(f"[bold]NOT NORMAL — {len(bad)} of {len(rows)}[/]")
+        for r in bad:
+            state = ("[red]down[/]" if r["reach"] is False else
+                     "[grey35]reach untested[/]" if r["reach"] is None else "up")
+            a = ("[bold red]auth fail[/]" if r["auth"] is False else
+                 "[grey35]auth untested[/]" if r["auth"] is None else "auth ok")
+            fl = faults_of(r)
+            con.print(f"  [bold]{r['name']:<8}[/]{r.get('zone') or '-':<5} {state}, {a}"
+                      + (f", [red]fault {','.join(fl)}[/]" if fl else "")
+                      + f"   {r.get('access') or '-'}   {r['item']}")
+        return
 
     if SHOW_TASKS:
         if TASKS is None:
@@ -1567,18 +1618,7 @@ def render(rows, meta):
                   "[bold red]fail[/]" if r["auth"] is False else DASH,
                   (r.get("check") if SHOW_CHECK else r.get("access")) or DASH,
                   r["item"],
-                  ",".join(f for f, bad in (("url", r.get("endpoint_malformed")),
-                                            ("ip", r.get("ip_drift")),
-                                            ("tag", r.get("type_drift")),
-                                            ("name", r.get("name_mismatch")),
-                                            ("access", r.get("access_unreachable")),
-                                            ("cred", r.get("cred_fallback")),
-                                            # A recorded expiry is only worth a column once it
-                                            # is near — or already past, which reads as negative
-                                            # days and must still fault rather than going quiet.
-                                            ("expiry", r.get("cred_expiry") is not None
-                                             and r["cred_expiry"] <= EXPIRY_WARN_DAYS),
-                                            ("dup", r.get("name_collision"))) if bad)]
+                  ",".join(faults_of(r))]
         t.add_row(*cells)
 
     # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
