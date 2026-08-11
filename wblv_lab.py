@@ -195,7 +195,7 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab --mac        add the MAC column
   wblv-lab --check      swap ACCESS for what each probe actually did
   wblv-lab --json       machine-readable
-  wblv-lab --brief      counts + Members + only what is NOT normal (what the hook reads)
+  wblv-lab --howto      the exact call that logs in to each member\n  wblv-lab --howto nas-01  just that one\n  wblv-lab --brief      counts + Members + only what is NOT normal (what the hook reads)
   wblv-lab --tasks      swap the member table for open work (jsm-01)
   wblv-lab --tasks 1a.5 resolve one task by its Lab ID
   wblv-lab --test       every view in turn, from a single probe pass
@@ -258,7 +258,7 @@ if {"-h", "--help", "help"} & set(sys.argv[1:]):
 # said nothing -- you asked for one view and silently got another. That is the same defect the
 # whole tool is built against, sitting in its own argument parsing. Typos are the common case
 # and they are exactly when a confident wrong answer does the most damage.
-KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks",
+KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "--howto",
          "-h", "--help", "help"}
 _bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN]
 if _bad:
@@ -296,10 +296,19 @@ SHOW_TEST = "--test" in sys.argv
 # never ran" stay distinguishable; health is never implied by the absence of rows.
 SHOW_BRIEF = "--brief" in sys.argv
 
+# The recipes go in the session brief rather than behind a flag, because the evidence is that
+# a flag I have been told about is still a flag I do not reach for: every one of these logins
+# was got wrong by hand while the ACCESS URI and credential item were already in context.
+# Knowing WHERE was never the problem.
+SHOW_HOWTO = "--howto" in sys.argv
+
 # No -j alias: it shadowed the obvious short form of --json and would have piped a Rich table
 # into a JSON parser, passing the unknown-option guard on the way.
 SHOW_TASKS = "--tasks" in sys.argv
-TASK_ID = next((a for a in sys.argv[1:] if not a.startswith("-")), None) if SHOW_TASKS else None
+# One positional, shared by the two flags that take one. Guarded on either being present so
+# a bare `wblv-lab foo` cannot silently become a filter for something.
+TASK_ID = (next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+           if (SHOW_TASKS or SHOW_HOWTO) else None)
 
 
 # --- 1Password substrate ------------------------------------------------------------------
@@ -676,6 +685,20 @@ def nc_open(host, port, t=3):
 def ping_ok(host, t=2):
     return subprocess.run(["ping", "-c", "1", "-t", str(t), host], capture_output=True).returncode == 0
 
+# These four literals are exactly the ones that were got wrong by hand — each is now named
+# once and referenced by BOTH the probe that uses it and the recipe that documents it, so a
+# recipe cannot describe a login the probe does not perform.
+SSH_LEGACY_OPTS = ["HostKeyAlgorithms=+ssh-rsa",
+                   "PubkeyAcceptedAlgorithms=+ssh-rsa",
+                   "KexAlgorithms=+diffie-hellman-group14-sha1"]
+DSM_AUTH_VERSION = "7"
+# Not an arbitrary label: DSM scopes a session to an application, and an account restricted
+# to FileStation is refused 402 under any other name. Discovered by getting it wrong.
+DSM_SESSION = "FileStation"
+# OPNsense items store the credential with a literal prefix in the field value.
+OPN_PREFIXES = {"api_key": "key=", "api_secret": "secret="}
+
+
 def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
     """Password SSH, one mechanism for every host — consistency over key management.
 
@@ -699,9 +722,7 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
         # negative indistinguishable from a real fault. Asked for explicitly, per platform,
         # rather than globally: weakening the client for every host to suit the worst one is
         # how a workaround becomes the standard.
-        args += ["-o", "HostKeyAlgorithms=+ssh-rsa",
-                 "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
-                 "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
+        args += [x for o in SSH_LEGACY_OPTS for x in ("-o", o)] + [
                  "-o", "Ciphers=+aes128-cbc"]
     args += [f"{user}@{host}", cmd]
     note_op(f"ssh {user}@{host}" + (f" -- {cmd}" if cmd else ""))
@@ -813,8 +834,8 @@ def auth_probe(r):
         if not host:
             return None, "no endpoint to test"
         if r["platform"] == "opnsense":
-            k = (c.get("api_key") or c.get("key") or "").removeprefix("key=")
-            sec = (c.get("api_secret") or c.get("secret") or "").removeprefix("secret=")
+            k = (c.get("api_key") or c.get("key") or "").removeprefix(OPN_PREFIXES["api_key"])
+            sec = (c.get("api_secret") or c.get("secret") or "").removeprefix(OPN_PREFIXES["api_secret"])
             got, body = curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}")
             if not got:
                 return None, "no answer from the API"
@@ -832,15 +853,19 @@ def auth_probe(r):
             # recorder too, and the row would claim nothing was checked.
             note_op(f"GET {host}:{dsm}/webapi/entry.cgi")
             out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
-                "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
+                "--data-urlencode", "api=SYNO.API.Auth",
+                "--data-urlencode", f"version={DSM_AUTH_VERSION}",
                 "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
-                "--data-urlencode", f"passwd={pw}", "--data-urlencode", "session=FileStation",
+                "--data-urlencode", f"passwd={pw}",
+                "--data-urlencode", f"session={DSM_SESSION}",
                 "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
             sid = (json.loads(out or "{}").get("data") or {}).get("sid")
             if sid:   # release it: repeated DSM logins churn sessions and can trip auto-block
                 subprocess.run(["curl", "-sk", "--max-time", "8", "-G", base,
-                    "--data-urlencode", "api=SYNO.API.Auth", "--data-urlencode", "version=7",
-                    "--data-urlencode", "method=logout", "--data-urlencode", "session=FileStation",
+                    "--data-urlencode", "api=SYNO.API.Auth",
+                    "--data-urlencode", f"version={DSM_AUTH_VERSION}",
+                    "--data-urlencode", "method=logout",
+                    "--data-urlencode", f"session={DSM_SESSION}",
                     "--data-urlencode", f"_sid={sid}"], capture_output=True)
             return (bool(sid), "DSM login ok" if sid else "DSM rejected the credential")
         if r["platform"] in ("aruba-switch", "linux", "tplink-eap"):
@@ -1450,6 +1475,75 @@ def jira_snapshot(rows):
     return out
 
 
+def howto(r):
+    """The exact call that authenticates to this member, assembled from the same constants
+    the probe uses and the same live member data everything else here reads.
+
+    NOT prose. "Strip the key= prefix" is an instruction to be interpreted and misread; a
+    literal invocation is a value. Every one of these was got wrong by hand at least once,
+    and in each case the correct answer was already sitting in auth_probe where nothing could
+    read it — this tool's own description is "here's how you get in", and that half of it
+    lived only in code.
+
+    A line marked UNVERIFIED is inferred from the probe rather than run end to end. Saying so
+    is the point: an unrun command presented as a working one is the same defect as an
+    unmeasured value presented as a measurement."""
+    host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0]
+    item, acct, pf = r["item"], r.get("account") or "", r["platform"]
+    OP = f'op item get "{item}" --vault {VAULT}'
+    out = []
+    if pf == "opnsense":
+        kp, sp = OPN_PREFIXES["api_key"], OPN_PREFIXES["api_secret"]
+        out += [f'K=$({OP} --fields label="API Key" --reveal | sed \'s/^{kp}//\')',
+                f'S=$({OP} --fields label="API Secret" --reveal | sed \'s/^{sp}//\')',
+                f'curl -sk -u "$K:$S" https://{host}/api/core/firmware/status',
+                f'# the {kp}/{sp} prefix is IN the field value; unstripped it is a silent 401']
+    elif pf == "synology":
+        port = r.get("port") or 5001
+        out += [f'U=$({OP} --fields label=username --reveal); P=$({OP} --fields label=password --reveal)',
+                f'curl -sk -G https://{host}:{port}/webapi/entry.cgi \\',
+                f'  --data-urlencode api=SYNO.API.Auth --data-urlencode version={DSM_AUTH_VERSION} \\',
+                f'  --data-urlencode method=login --data-urlencode session={DSM_SESSION} \\',
+                f'  --data-urlencode format=sid --data-urlencode account="$U" --data-urlencode passwd="$P"',
+                f'# session MUST be {DSM_SESSION} — any other name is refused 402. Log out after.',
+                '# NEVER in parallel: concurrent logins race DSM and trip its auto-block.']
+    elif pf == "aruba-switch":
+        out += [f'ssh {acct}@{host}          # KEY ONLY — no password. Interactive CLI, operator (>)',
+                '# password auth burns attempts toward brute-force lockout on a fabric device',
+                '# UNVERIFIED end to end: inferred from aruba_probe, not run from this recipe']
+    elif pf == "tplink-eap":
+        opts = " ".join(f"-o {o}" for o in SSH_LEGACY_OPTS)
+        out += [f'P=$({OP} --fields label=password --reveal)',
+                f"ssh {opts} \\\\", f"    {acct}@{host} '<command>'",
+                '# offers only legacy host keys and no setting to fix it; ask per-host, never globally']
+    elif pf == "linux":
+        out += [f'P=$({OP} --fields label=password --reveal)',
+                f"ssh -o StrictHostKeyChecking=no {acct}@{host} '<command>'   # password auth"]
+    elif pf == "jira":
+        out += [f'T=$({OP} --fields label="API Key" --reveal)',
+                f'curl -s -u "{acct}:$T" -H "Accept: application/json" https://{host}/rest/api/3/myself',
+                '# basic auth, not the SSO login: an Entra-federated account cannot present IdP creds here']
+    elif pf == "github":
+        out += [f'T=$({OP} --fields label="API Key" --reveal)',
+                'curl -s -H "Authorization: Bearer $T" https://api.github.com/user',
+                '# falls back to `gh auth token` if the vault field is empty — check which one answered']
+    elif pf == "microsoft-graph":
+        out += [f'# tenant_id/client_id/client_secret from: {OP}',
+                'curl -s -X POST https://login.microsoftonline.com/$TID/oauth2/v2.0/token \\',
+                '  -d "client_id=$CID&client_secret=$CSEC&grant_type=client_credentials" \\',
+                '  -d "scope=https://graph.microsoft.com/.default"']
+    elif pf == "tailscale":
+        out += [f'# client_id/client_secret from: {OP}',
+                'curl -s -X POST https://api.tailscale.com/api/v2/oauth/token \\',
+                '  -d "client_id=$CID&client_secret=$CSEC"   # then Bearer the access_token']
+    elif pf == "1password":
+        out += [f'export OP_SERVICE_ACCOUNT_TOKEN="$(cat {TOKEN_PATH.replace(os.path.expanduser("~"), "~")})"',
+                'op whoami']
+    else:
+        out += [f'# no recipe for platform {pf!r} — read the probe in wblv_lab.py before guessing']
+    return out
+
+
 def faults_of(r):
     """The FAULT column, as data. One implementation because two would drift: --brief once
     tested a key that did not exist, so its fault branch could never fire -- a check that
@@ -1563,6 +1657,22 @@ def render(rows, meta):
                        + ("  [yellow](truncated at 200)[/]" if TASKS["truncated"] else ""))
     con.print()
 
+    def _howto_block():
+        con.print()
+        con.print("[bold]How to authenticate[/] — exact calls, generated from the probes. "
+                  "Read before connecting.")
+        want = TASK_ID  # reuse the positional: --howto nas-01
+        for r in rows:
+            if want and r["name"] != want:
+                continue
+            con.print(f"\n[bold]{r['name']}[/]  [dim]{r['platform']}  {r.get('access') or '-'}[/]")
+            for l in howto(r):
+                con.print("  " + ("[dim]" + l + "[/]" if l.lstrip().startswith("#") else l))
+
+    if SHOW_HOWTO and not SHOW_BRIEF:
+        _howto_block()
+        return
+
     if SHOW_BRIEF:
         # Named explicitly rather than scraped from a column: the hook hands this list to the
         # to-do generator so it does not make its own probe, and a consumer that has to parse
@@ -1571,6 +1681,7 @@ def render(rows, meta):
         bad = [r for r in rows
                if r["reach"] is not True or r["auth"] is not True or faults_of(r)]
         if not bad:
+            if SHOW_HOWTO: _howto_block()
             return          # Faults/Reachable/Authenticated above already state it, measured
         con.print()
         # Only what is not normal, with why. One line each: the full row is one command away
@@ -1585,6 +1696,7 @@ def render(rows, meta):
             con.print(f"  [bold]{r['name']:<8}[/]{r.get('zone') or '-':<5} {state}, {a}"
                       + (f", [red]fault {','.join(fl)}[/]" if fl else "")
                       + f"   {r.get('access') or '-'}   {r['item']}")
+        if SHOW_HOWTO: _howto_block()
         return
 
     if SHOW_TASKS:
