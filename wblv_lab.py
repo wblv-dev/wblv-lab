@@ -16,7 +16,7 @@ what its vault item declares it is. What remains in code is knowledge of vendors
 dialect each platform speaks, and where its endpoint lives — which changes when a vendor
 changes, not when Harry renames a box.
 """
-import os, sys, json, re, socket, subprocess, tempfile, threading, time, datetime
+import os, sys, json, re, base64, socket, subprocess, tempfile, threading, time, datetime
 try:
     import pexpect
 except ImportError:
@@ -758,6 +758,19 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
         i = c.expect([expect_token, r"[Pp]ermission denied", r"[Aa]uthentication failed",
                       pexpect.EOF, pexpect.TIMEOUT])
         if i == 0:
+            # Drain the rest of the session so a capability check can ride the SAME login
+            # rather than opening a second one. "login ok" says the credential works; it says
+            # nothing about what it can then do, and on this estate those differ sharply —
+            # rpi-01's account authenticates perfectly and holds no sudo at all.
+            try:
+                c.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=8)
+            except Exception:
+                pass
+            tail = c.before or ""
+            if "NOSUDO" in tail:
+                return True, "login ok, no sudo"
+            if "SUDO" in tail:
+                return True, "login ok, SUDO"
             return True, "login ok"
         return False, ("credential rejected" if i in (1, 2) else
                        "connected but no expected response")
@@ -891,7 +904,22 @@ def auth_probe(r):
                     "--data-urlencode", "method=logout",
                     "--data-urlencode", f"session={DSM_SESSION}",
                     "--data-urlencode", f"_sid={sid}"], capture_output=True)
-            return (bool(sid), "DSM login ok" if sid else "DSM rejected the credential")
+            if not sid:
+                return False, "DSM rejected the credential"
+            # A bare "DSM login ok" reads as full access to the box holding the backups, and
+            # this credential is refused on most Core APIs. One representative READ, inside the
+            # session already open, turns that into a measurement. 105 is "insufficient
+            # permission", which is a different answer from the API not existing.
+            info = subprocess.run(["curl", "-sk", "--max-time", "10", "-G", base,
+                "--data-urlencode", "api=SYNO.Core.System", "--data-urlencode", "version=1",
+                "--data-urlencode", "method=info", "--data-urlencode", f"_sid={sid}"],
+                capture_output=True, text=True).stdout
+            try:
+                ok = bool(json.loads(info or "{}").get("success"))
+            except ValueError:
+                ok = False
+            return True, ("DSM login ok, config-read" if ok
+                          else "DSM login ok, LOGIN ONLY (Core APIs refused)")
         if r["platform"] in ("aruba-switch", "linux", "tplink-eap"):
             u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
             pw = (c.get("password") or c.get("confirmpassword")
@@ -910,7 +938,13 @@ def auth_probe(r):
             # (uid 1, cannot even write /dev/null), not the restricted CLI its GUI implies, so
             # the same echo test proves the session for real. Its host keys are ssh-rsa/ssh-dss
             # only, hence legacy.
-            return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok",
+            # linux answers a sudo question for free on the session it is already opening.
+            # The EAP's BusyBox has no `id` and no sudo, and cannot even write /dev/null, so
+            # asking would produce noise rather than an answer -- it stays unmeasured, and says
+            # so, rather than being reported as unprivileged on an assumption.
+            cmd = ("echo wblv-ok; sudo -n true 2>/dev/null && echo SUDO || echo NOSUDO"
+                   if r["platform"] == "linux" else "echo wblv-ok")
+            return ssh_probe(u, host, pw, r"wblv-ok", cmd,
                              legacy=r["platform"] == "tplink-eap")
         if r["platform"] == "microsoft-graph":
             # Client-credentials against the tenant. A token issued is proof the app
@@ -928,6 +962,21 @@ def auth_probe(r):
                 return None, "no answer from the token endpoint"
             j = json.loads(body or "{}")
             if j.get("access_token"):
+                # The token carries its own grants in the `roles` claim, so what this
+                # credential can DO costs nothing extra to report — it is already in hand.
+                # "Graph token issued" only ever said the secret was live. Whether those
+                # grants are read-only is the fact the estate's read-only doctrine turns on,
+                # and it was invisible.
+                try:
+                    _pl = j["access_token"].split(".")[1]
+                    _pl += "=" * (-len(_pl) % 4)
+                    _roles = json.loads(base64.urlsafe_b64decode(_pl)).get("roles") or []
+                    _w = [x for x in _roles if ".ReadWrite." in x or x.endswith(".Write")]
+                    if _roles:
+                        return True, (f"Graph token, {len(_roles)} roles, "
+                                      + (f"{len(_w)} WRITE" if _w else "all read"))
+                except Exception:
+                    pass          # a token that will not decode is still a token that issued
                 return True, "Graph token issued"
             # An answer that is not a token is not automatically a rejection. OAuth names its
             # server-side transients, and reading one as "your credential is bad" sends Harry
