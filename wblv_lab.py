@@ -550,11 +550,18 @@ if not (K and S):
     die(f"the OPNsense item '{opn['item']}' has no API Key / API Secret fields")
 
 API = f"https://{opn['endpoint']}/api"
-inventory, arp = {}, {}
+inventory, arp, ROUTER_MACS = {}, {}, set()
 # Independent endpoints, so they are read at the same time rather than one after the other.
-with ThreadPoolExecutor(max_workers=2) as ex:
+with ThreadPoolExecutor(max_workers=3) as ex:
     _dns = ex.submit(curl, f"{API}/dnsmasq/settings/get", "-u", f"{K}:{S}")
     _arp = ex.submit(curl, f"{API}/diagnostics/interface/get_arp", "-u", f"{K}:{S}")
+    # The router does not hold a DHCP reservation for itself -- it IS the DHCP server -- so its
+    # own interfaces carry no MAC in the IPAM and every one of them counted as an address "no
+    # vault item claims". Three of fourteen non-members were opn-01 talking to itself, and the
+    # count had been overstating since it existed because a bare number cannot be inspected.
+    # DERIVED, not declared: the router knows its own interfaces, so nothing goes in a vault
+    # item that would then have to be maintained by hand.
+    _ifs = ex.submit(curl, f"{API}/interfaces/overview/interfacesInfo", "-u", f"{K}:{S}")
 try:
     dj = json.loads(_dns.result()[1] or "{}")
     for h in (dj.get("dnsmasq", {}).get("hosts", {}) or {}).values():
@@ -585,6 +592,17 @@ try:
             arp[e["mac"].lower()] = e
 except Exception:
     pass                                   # vendor and zone are enrichment, not load-bearing
+
+try:
+    _ij = json.loads(_ifs.result()[1] or "{}")
+    for _r in (_ij.get("rows") if isinstance(_ij, dict) else _ij) or []:
+        _m = (_r.get("macaddr") or _r.get("mac") or "").lower()
+        # 00:00:00:00:00:00 is what a PPPoE/loopback pseudo-interface reports; claiming it
+        # would swallow every device that also reports all-zeroes.
+        if _m and _m != "00:00:00:00:00:00":
+            ROUTER_MACS.add(_m)
+except Exception:
+    pass          # unclaimed interfaces inflate the count again -- visibly, not silently
 
 
 # Every REACH result is measured FROM HERE, and "rpi-01 / LAN / up" only means "a pinhole is
@@ -1346,7 +1364,8 @@ OFF_MEMBERS = sorted(
       "zone": e.get("intf_description") or e.get("intf") or "",
       "vendor": (e.get("manufacturer") or "").strip(),
       "hostname": (e.get("hostname") or "").strip()}
-     for mac, e in arp.items() if mac not in _member_macs),
+     for mac, e in arp.items()
+     if mac not in _member_macs and mac not in ROUTER_MACS),
     key=lambda x: (x["zone"], x["ip"]))
 OFF_DIRECTORY = len(OFF_MEMBERS)
 _classified = [c for c in _all if not WANT or c["type"] in WANT]
