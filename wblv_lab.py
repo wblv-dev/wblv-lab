@@ -1750,12 +1750,28 @@ if __name__ == "__main__":
             SHOW_MAC, SHOW_CHECK = mac, chk
             print(f"\n{'=' * 78}\n$ {label}\n{'=' * 78}")
             render([r for r in shown if not want or r["type"] in want], meta)
-        # --tasks swaps the table, so it cannot ride the loop above: the loop varies which
-        # MEMBERS are shown, and this varies what the table IS. Same single probe pass.
+        # These swap the table rather than filtering it, so they cannot ride the loop above:
+        # the loop varies which MEMBERS are shown, these vary what the table IS. Same single
+        # probe pass, so every view still agrees with every other by construction.
         SHOW_MAC = SHOW_CHECK = False
+        # --brief FIRST, because it is the view the session hook actually reads. It was the one
+        # view --test did not cover, which is the wrong way round for a whole-surface check.
+        SHOW_BRIEF = True
+        print(f"\n{'=' * 78}\n$ wblv-lab --brief\n{'=' * 78}")
+        render(shown, meta)
+        SHOW_BRIEF = False
         SHOW_TASKS = True
         print(f"\n{'=' * 78}\n$ wblv-lab --tasks\n{'=' * 78}")
         render(shown, meta)
+        # A real id, taken from the snapshot rather than hardcoded: a literal would rot the
+        # first time that task closed, and the check would then pass by printing "not found".
+        _t = tasks_snapshot()
+        _id = (_t["ready"] + _t["blocked"])[0]["id"] if isinstance(_t, dict) and (_t["ready"] or _t["blocked"]) else None
+        if _id:
+            TASK_ID = _id
+            print(f"\n{'=' * 78}\n$ wblv-lab --tasks {_id}\n{'=' * 78}")
+            render(shown, meta)
+            TASK_ID = None
         SHOW_TASKS = False
         print(f"\n{'=' * 78}\n$ wblv-lab --json\n{'=' * 78}")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON}
