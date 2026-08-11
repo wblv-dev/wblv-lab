@@ -918,8 +918,12 @@ def auth_probe(r):
                 ok = bool(json.loads(info or "{}").get("success"))
             except ValueError:
                 ok = False
-            return True, ("DSM login ok, config-read" if ok
-                          else "DSM login ok, LOGIN ONLY (Core APIs refused)")
+            # Name the API that was actually tried. "Core APIs refused" generalises from ONE
+            # sample to a class — true here, as it happens, but the probe does not prove it,
+            # and a label that claims more than it measured is the defect this tool exists to
+            # catch. Widening the sample would mean more DSM logins, which trips its auto-block.
+            return True, ("DSM login ok, Core.System readable" if ok
+                          else "DSM login ok, Core.System REFUSED (105)")
         if r["platform"] in ("aruba-switch", "linux", "tplink-eap"):
             u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
             pw = (c.get("password") or c.get("confirmpassword")
