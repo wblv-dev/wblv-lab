@@ -888,7 +888,13 @@ def auth_probe(r):
             # Recorded here because this probe drives curl directly rather than through
             # curl(), for the logout it has to issue. A call that skips the helper skips the
             # recorder too, and the row would claim nothing was checked.
-            note_op(f"GET {host}:{dsm}/webapi/entry.cgi")
+            # Every DSM call goes to entry.cgi, so a note_op naming only the path collapses
+            # three operations into one -- note_op dedupes identical text by design. Name the
+            # API instead, or --check reports one call on a run that made three, in a tool
+            # whose stated contract is that probe_ops describes what HAPPENED.
+            # The api= label is constructed here, not lifted from the query string: the query
+            # string is where the password rides and must never reach the recorder.
+            note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.API.Auth (login)")
             out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
                 "--data-urlencode", "api=SYNO.API.Auth",
                 "--data-urlencode", f"version={DSM_AUTH_VERSION}",
@@ -897,19 +903,18 @@ def auth_probe(r):
                 "--data-urlencode", f"session={DSM_SESSION}",
                 "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
             sid = (json.loads(out or "{}").get("data") or {}).get("sid")
-            if sid:   # release it: repeated DSM logins churn sessions and can trip auto-block
-                subprocess.run(["curl", "-sk", "--max-time", "8", "-G", base,
-                    "--data-urlencode", "api=SYNO.API.Auth",
-                    "--data-urlencode", f"version={DSM_AUTH_VERSION}",
-                    "--data-urlencode", "method=logout",
-                    "--data-urlencode", f"session={DSM_SESSION}",
-                    "--data-urlencode", f"_sid={sid}"], capture_output=True)
             if not sid:
                 return False, "DSM rejected the credential"
-            # A bare "DSM login ok" reads as full access to the box holding the backups, and
-            # this credential is refused on most Core APIs. One representative READ, inside the
-            # session already open, turns that into a measurement. 105 is "insufficient
+            # ⚠ ORDER IS LOAD-BEARING. The capability read must happen while the session is
+            # still valid. Written the other way round — logout first — a dead session returns
+            # an error that looks exactly like a permissions refusal, and the probe would have
+            # reported "insufficient permission" about a session it had just closed itself.
+            # Right answer, wrong reason, and nothing in the output would have said so.
+            #
+            # A bare "DSM login ok" reads as full access to the box holding the backups. One
+            # representative READ turns that into a measurement. 105 is "insufficient
             # permission", which is a different answer from the API not existing.
+            note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.Core.System")
             info = subprocess.run(["curl", "-sk", "--max-time", "10", "-G", base,
                 "--data-urlencode", "api=SYNO.Core.System", "--data-urlencode", "version=1",
                 "--data-urlencode", "method=info", "--data-urlencode", f"_sid={sid}"],
@@ -918,6 +923,15 @@ def auth_probe(r):
                 ok = bool(json.loads(info or "{}").get("success"))
             except ValueError:
                 ok = False
+            # Released only now, once nothing else needs the session. Repeated DSM logins churn
+            # sessions and can trip the auto-block, so every run must hand its own back.
+            note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.API.Auth (logout)")
+            subprocess.run(["curl", "-sk", "--max-time", "8", "-G", base,
+                "--data-urlencode", "api=SYNO.API.Auth",
+                "--data-urlencode", f"version={DSM_AUTH_VERSION}",
+                "--data-urlencode", "method=logout",
+                "--data-urlencode", f"session={DSM_SESSION}",
+                "--data-urlencode", f"_sid={sid}"], capture_output=True)
             # Name the API that was actually tried. "Core APIs refused" generalises from ONE
             # sample to a class — true here, as it happens, but the probe does not prove it,
             # and a label that claims more than it measured is the defect this tool exists to
