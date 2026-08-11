@@ -195,6 +195,7 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab --mac        add the MAC column
   wblv-lab --check      swap ACCESS for what each probe actually did
   wblv-lab --json       machine-readable
+  wblv-lab --others     what is on the wire that the directory does NOT claim
   wblv-lab --howto      the exact call that logs in to each member\n  wblv-lab --howto nas-01  just that one\n  wblv-lab --brief      counts + Members + only what is NOT normal (what the hook reads)
   wblv-lab --tasks      swap the member table for open work (jsm-01)
   wblv-lab --tasks 1a.5 resolve one task by its Lab ID
@@ -258,7 +259,7 @@ if {"-h", "--help", "help"} & set(sys.argv[1:]):
 # said nothing -- you asked for one view and silently got another. That is the same defect the
 # whole tool is built against, sitting in its own argument parsing. Typos are the common case
 # and they are exactly when a confident wrong answer does the most damage.
-KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "--howto",
+KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "--howto", "--others",
          "-h", "--help", "help"}
 _bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN]
 if _bad:
@@ -301,6 +302,11 @@ SHOW_BRIEF = "--brief" in sys.argv
 # was got wrong by hand while the ACCESS URI and credential item were already in context.
 # Knowing WHERE was never the problem.
 SHOW_HOWTO = "--howto" in sys.argv
+
+# Swaps the member table for what is on the wire and NOT in the directory. Same slot, same
+# reasoning as --check and --tasks: "what do I have" and "what is here that I do not have"
+# are different questions, and the default answers the first.
+SHOW_OTHERS = "--others" in sys.argv
 
 # No -j alias: it shadowed the obvious short form of --json and would have piped a Rich table
 # into a JSON parser, passing the unknown-option guard on the way.
@@ -1331,7 +1337,18 @@ for _n, _rs in _seen.items():
 # host, which is why it is counted here and not attached to a row. Counted before the filter,
 # because a filtered view does not make the rest of the lab stop existing.
 _member_macs = {r["mac"] for r in _all if r.get("mac")}
-OFF_DIRECTORY = sum(1 for mac in arp if mac not in _member_macs)
+# A COUNT cannot tell you a device appeared. "14 things on your wire that no vault item
+# claims" answers "how much of the wire is accounted for" but not "what is alive", which is
+# the question this tool exists for — so keep the detail, not just the tally. It is also what
+# a since-last-session diff needs: you cannot diff a number into "this is new".
+OFF_MEMBERS = sorted(
+    ({"ip": e.get("ip", ""), "mac": mac,
+      "zone": e.get("intf_description") or e.get("intf") or "",
+      "vendor": (e.get("manufacturer") or "").strip(),
+      "hostname": (e.get("hostname") or "").strip()}
+     for mac, e in arp.items() if mac not in _member_macs),
+    key=lambda x: (x["zone"], x["ip"]))
+OFF_DIRECTORY = len(OFF_MEMBERS)
 _classified = [c for c in _all if not WANT or c["type"] in WANT]
 with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; NAS stays single
     rows = list(ex.map(probe, _classified))
@@ -1669,6 +1686,30 @@ def render(rows, meta):
             for l in howto(r):
                 con.print("  " + ("[dim]" + l + "[/]" if l.lstrip().startswith("#") else l))
 
+    if SHOW_OTHERS:
+        if not OFF_MEMBERS:
+            con.print("[dim]nothing on the wire that the directory does not claim[/]")
+            return
+        t = Table(box=box.SIMPLE, show_edge=False, header_style="bold",
+                  border_style="grey35", pad_edge=False, padding=(0, 1))
+        t.add_column("ADDRESS", style="bold", no_wrap=True)
+        t.add_column("MAC", style="grey50", no_wrap=True)
+        t.add_column("ZONE", no_wrap=True)
+        t.add_column("VENDOR", no_wrap=True)
+        t.add_column("HOSTNAME")
+        DASH = "[grey35]-[/]"
+        for o in OFF_MEMBERS:
+            t.add_row(o["ip"] or DASH, o["mac"], o["zone"] or DASH,
+                      o["vendor"] or DASH, o["hostname"] or DASH)
+        probe = Console(width=10_000, no_color=True)
+        natural = Measurement.get(probe, probe.options, t).maximum
+        out = con if natural <= con.width else Console(width=natural, highlight=False)
+        rule = "[grey35]" + "─" * natural + "[/]"
+        out.print(rule); out.print(t); out.print(rule)
+        con.print("[dim]Not a fault: these are addresses OPNsense can see that no vault item "
+                  "claims. Onboarding is data — add an item and it becomes a member.[/]")
+        return
+
     if SHOW_HOWTO and not SHOW_BRIEF:
         _howto_block()
         return
@@ -1833,6 +1874,7 @@ if __name__ == "__main__":
     meta = {"vault": VAULT, "ipam_source": opn["endpoint"],
             "prober": PROBER, "prober_zone": PROBER_ZONE,
             "runtime_s": round(time.time() - _T0, 1), "off_directory": OFF_DIRECTORY,
+            "off_directory_members": OFF_MEMBERS,
             "token_file_age_days": TOKEN_FILE_AGE_DAYS}
     if "--json" in sys.argv:
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON} for r in shown]},
