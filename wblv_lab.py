@@ -1381,7 +1381,16 @@ rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 #
 # ⚠ Returns None for UNTESTED and never a zeroed dict. A Jira outage that reported "0 open"
 # would read as "all work is done", which is the worst possible lie this tool could tell.
-LAB_PROJECT = "LAB"
+# ⚠ The project key and the custom-field IDs are facts about THIS lab and THIS Jira site.
+# They were hardcoded here, which is the precise thing the comment ~900 lines above records
+# as having been deliberately removed ("the last fact about THIS lab left in the code").
+# Both are now DISCOVERED: the key from the site, the field ids by NAME. A customfield_10042
+# is meaningless on any other tenant and would silently read as empty rather than failing.
+JIRA_FIELDS = ("Lab ID", "Hands", "Last verified")
+# Why a False came back. "The far end refused" and "you have two projects and have not said
+# which" are both False, but they send you to completely different places -- and a tool that
+# names the wrong cause is worse than one that says nothing.
+TASKS_WHY = []
 
 
 def esc(t):
@@ -1415,7 +1424,33 @@ def jira_snapshot(rows):
     # WORK is hierarchyLevel 0. Epics (1) are containers and sub-tasks (-1) would double-count
     # their parent. Filtered by TYPE ID, not by name: "issuetype != Epic" silently starts
     # counting epics as work the day somebody renames the type, and nothing would say so.
-    got, body = curl(f"https://{host}/rest/api/3/project/{LAB_PROJECT}",
+    # Which project? Discovered, not named. One project on the site is unambiguous, so use it.
+    # More than one and the tool must be TOLD which -- guessing would silently report another
+    # project's backlog as the lab's. The vault is where a member declares things about itself,
+    # so a "Project" field on the item settles it.
+    got, body = curl(f"https://{host}/rest/api/3/project/search?maxResults=50",
+                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
+    if not got:
+        return None
+    try:
+        projects = json.loads(body or "{}").get("values") or []
+    except ValueError:
+        return None
+    declared = (c.get("project") or "").strip()
+    if declared:
+        proj = next((p for p in projects if p.get("key") == declared), None)
+        if not proj:
+            TASKS_WHY.append(f"the item declares project {declared!r}, which this credential cannot see")
+            return False
+    elif len(projects) == 1:
+        proj = projects[0]
+    else:
+        TASKS_WHY.append(f"{len(projects)} projects visible and the vault item names none — "
+                         f"add a Project field to the item ({', '.join(p['key'] for p in projects[:6])})")
+        return False
+    key = proj["key"]
+
+    got, body = curl(f"https://{host}/rest/api/3/project/{key}",
                      "--config", "-", stdin=f'user = "{user}:{k}"\n')
     if not got:
         return None
@@ -1431,18 +1466,35 @@ def jira_snapshot(rows):
         return False
     only = f"issuetype in ({', '.join(work_ids)})"
 
+    # Field IDs by name. Empty is not "no such field": it means the lookup failed, and the
+    # caller must not then render every task as having no Lab ID and no owner.
+    got, body = curl(f"https://{host}/rest/api/3/field",
+                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
+    if not got:
+        return None
+    try:
+        by_name = {f.get("name"): f.get("id") for f in json.loads(body or "[]")}
+    except ValueError:
+        return None
+    FID = {n: by_name.get(n) for n in JIRA_FIELDS}
+    if not FID["Lab ID"]:
+        # Without it every task falls back to its Jira key, and the vault's 1a.5 references
+        # stop resolving. Better to say the field is missing than to renumber the estate.
+        TASKS_WHY.append("the Jira site has no custom field named 'Lab ID' — task ids would "
+                         "fall back to Jira keys and the vault's references would stop resolving")
+        return False
+
     # Fetch OPEN work only. Done issues never leave a project, so a whole-project fetch is
     # bounded by HISTORY rather than by outstanding work — it would have crossed any cap on
     # completed tasks alone, and the counts would then have quietly meant "open among the
     # first N". Open work is the thing that is actually bounded.
     got, body = curl(f"https://{host}/rest/api/3/search/jql", "-G",
                      "--data-urlencode",
-                     f"jql=project = {LAB_PROJECT} AND {only} AND statusCategory != Done"
+                     f"jql=project = {key} AND {only} AND statusCategory != Done"
                      " ORDER BY created ASC",
                      "--data-urlencode", "maxResults=200",
-                     "--data-urlencode", "fields=summary,status,issuetype,issuelinks,parent,"
-                                         "fixVersions,customfield_10042,customfield_10045,"
-                                         "customfield_10046",
+                     "--data-urlencode", f"fields=summary,status,issuetype,issuelinks,parent,fixVersions,"
+                                     f"{FID['Lab ID']},{FID['Hands']},{FID['Last verified']}",
                      "--config", "-", stdin=f'user = "{user}:{k}"\n')
     if not got:
         return None
@@ -1458,7 +1510,7 @@ def jira_snapshot(rows):
     # costs one call instead of paging through every task ever finished.
     dgot, dbody = curl(f"https://{host}/rest/api/3/search/approximate-count",
                        "-X", "POST", "-H", "Content-Type: application/json",
-                       "-d", json.dumps({"jql": f"project = {LAB_PROJECT} AND {only}"
+                       "-d", json.dumps({"jql": f"project = {key} AND {only}"
                                                 " AND statusCategory = Done"}),
                        "--config", "-", stdin=f'user = "{user}:{k}"\n')
     try:
@@ -1475,8 +1527,8 @@ def jira_snapshot(rows):
     for i in issues:
         f = i["fields"]
         cat = f["status"]["statusCategory"]["key"]
-        labid = f.get("customfield_10042") or i["key"]
-        hands = (f.get("customfield_10045") or {}).get("value") or "-"
+        labid = f.get(FID["Lab ID"]) or i["key"]
+        hands = (f.get(FID["Hands"]) or {}).get("value") or "-"
         out["prog" if cat == "indeterminate" else "open"] += 1
         # "is blocked by" pointing at something not yet done. A link to a CLOSED blocker is
         # not a blocker, which is the difference between a dependency graph and a list of
@@ -1505,7 +1557,7 @@ def jira_snapshot(rows):
                 out["mine"].append(row)
     # Blocked rows name Jira keys; the vault speaks Lab IDs. Translate, because a runbook that
     # says "1e.1" and a hook that says "LAB-6" do not obviously refer to the same thing.
-    key2id = {i["key"]: (i["fields"].get("customfield_10042") or i["key"]) for i in issues}
+    key2id = {i["key"]: (i["fields"].get(FID["Lab ID"]) or i["key"]) for i in issues}
     for r in out["blocked"]:
         r["waits"] = [key2id.get(k, k) for k in r["waits"]]
     return out
@@ -1685,7 +1737,7 @@ def render(rows, meta):
     if TASKS is None:
         field("Tasks", "-", "dim")
     elif TASKS is False:
-        field("Tasks", "far end refused", "red")
+        field("Tasks", f"unavailable — {TASKS_WHY[0] if TASKS_WHY else 'far end refused'}", "red")
     else:
         _done = TASKS["done"]
         field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · "
@@ -1764,8 +1816,9 @@ def render(rows, meta):
             con.print("[dim]tasks UNTESTED — no answer from jsm-01. Not the same as no tasks.[/]")
             return
         if TASKS is False:
-            con.print("[red]tasks FAILED — jsm-01 answered and refused. Check the token, the "
-                      "project key, and whether the credential still browses LAB.[/]")
+            why = TASKS_WHY[0] if TASKS_WHY else ("jsm-01 answered but the task plane could "
+                                                  "not be resolved")
+            con.print(f"[red]tasks FAILED — {why}[/]")
             return
         DASH = "[grey35]-[/]"
         if TASK_ID:
