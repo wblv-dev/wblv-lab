@@ -806,6 +806,24 @@ def aruba_probe(user, host, pw, private_key=None):
         os.write(fd, (private_key if private_key.endswith("\n") else private_key + "\n").encode())
         os.close(fd)
         os.chmod(keyfile, 0o600)
+        # A malformed key file and a rejected credential are INDISTINGUISHABLE from the far
+        # end: the switch answers "Permission denied" to both. ssh-keygen -y parses the file
+        # offline, so mangled key material is caught HERE as what it is, instead of being
+        # reported as a bad credential and sending someone to rotate a working secret.
+        # It also costs no authentication attempt, and this box has brute-force lockout.
+        #
+        # The fetch that mangles it is the ordinary-looking one. `op item get --fields <label>
+        # --reveal` renders a multi-line SSHKEY value wrapped in literal double quotes AND led
+        # by a newline; ssh rejects that file outright. Stripping the quotes alone leaves the
+        # leading blank line and it is STILL invalid -- which is why the obvious one-line repair
+        # reproduces the identical symptom. Read the whole item as JSON instead (as CREDS does).
+        #
+        # UNTESTED, not failed: nothing was ever sent, so the far end never said no. Reporting
+        # this as a failure would be the exact misread the null/false split exists to prevent.
+        if subprocess.run(["ssh-keygen", "-y", "-f", keyfile], capture_output=True).returncode:
+            os.unlink(keyfile)
+            return None, ("private key material on the item is not a usable key file "
+                          "(malformed); nothing was sent, so this is untested, not rejected")
         # IdentitiesOnly and IdentityAgent=none force THIS key. With an agent in reach ssh can
         # authenticate on a different identity and the probe would report success for a
         # credential it never tested — the same reason the password path pins
@@ -1664,9 +1682,22 @@ def howto(r):
                 f'# session MUST be {DSM_SESSION} — any other name is refused 402. Log out after.',
                 '# NEVER in parallel: concurrent logins race DSM and trip its auto-block.']
     elif pf == "aruba-switch":
-        out += [f'ssh {acct}@{host}          # KEY ONLY — no password. Interactive CLI, operator (>)',
+        # KEY ONLY, and the key is the whole difficulty. --format json, never --fields: see
+        # the note in aruba_probe -- --fields renders a multi-line SSHKEY value quoted and
+        # newline-led, ssh rejects the FILE, and the switch reports it as "Permission denied".
+        out += ['K=$(mktemp -t wblv-swt); chmod 600 "$K"; trap \'rm -f "$K"\' EXIT',
+                f'{OP} --format json --reveal \\',
+                '  | jq -r \'.fields[] | select((.label|ascii_downcase)=="private key") | .value\' > "$K"',
+                'ssh-keygen -y -f "$K" >/dev/null || { echo "key material malformed, not connecting"; exit 1; }',
+                'ssh -o IdentitiesOnly=yes -o IdentityAgent=none -o PubkeyAcceptedAlgorithms=+ssh-rsa \\',
+                f'    -o PasswordAuthentication=no -i "$K" {acct}@{host}',
+                '# --fields would wrap this multi-line key in quotes and lead it with a newline;',
+                '#   stripping the quotes alone is STILL invalid, so ssh-keygen -y is the gate.',
+                '#   It parses the file offline: no auth attempt spent, and a mangled fetch stops',
+                '#   looking like a bad credential.',
                 '# password auth burns attempts toward brute-force lockout on a fabric device',
-                '# UNVERIFIED end to end: inferred from aruba_probe, not run from this recipe']
+                '# ArubaOS accepts NO command as an SSH argument: this opens an interactive CLI',
+                '#   at operator (>), behind a keypress banner. Scripted use needs pexpect.']
     elif pf == "tplink-eap":
         opts = " ".join(f"-o {o}" for o in SSH_LEGACY_OPTS)
         out += [f'P=$({OP} --fields label=password --reveal)',
