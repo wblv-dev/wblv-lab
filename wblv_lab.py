@@ -1655,7 +1655,8 @@ def howto(r):
                 f'# the {kp}/{sp} prefix is IN the field value; unstripped it is a silent 401']
     elif pf == "synology":
         port = r.get("port") or 5001
-        out += [f'U=$({OP} --fields label=username --reveal); P=$({OP} --fields label=password --reveal)',
+        out += [f'U=$({OP} --fields label=username --reveal)',
+                f'P=$({OP} --fields label=password --reveal)',
                 f'curl -sk -G https://{host}:{port}/webapi/entry.cgi \\',
                 f'  --data-urlencode api=SYNO.API.Auth --data-urlencode version={DSM_AUTH_VERSION} \\',
                 f'  --data-urlencode method=login --data-urlencode session={DSM_SESSION} \\',
@@ -1669,7 +1670,10 @@ def howto(r):
     elif pf == "tplink-eap":
         opts = " ".join(f"-o {o}" for o in SSH_LEGACY_OPTS)
         out += [f'P=$({OP} --fields label=password --reveal)',
-                f"ssh {opts} \\\\", f"    {acct}@{host} '<command>'",
+                # \\ in source = ONE literal backslash, the shell's line continuation. It was
+                # \\\\ here (two literal backslashes), which the shell reads as an escaped
+                # backslash and NOT a continuation — the recipe broke into two commands.
+                f"ssh {opts} \\", f"    {acct}@{host} '<command>'",
                 '# offers only legacy host keys and no setting to fix it; ask per-host, never globally']
     elif pf == "linux":
         out += [f'P=$({OP} --fields label=password --reveal)',
@@ -1821,8 +1825,15 @@ def render(rows, meta):
             if want and r["name"] != want:
                 continue
             con.print(f"\n[bold]{r['name']}[/]  [dim]{r['platform']}  {r.get('access') or '-'}[/]")
+            # soft_wrap: these are commands to be PASTED, not prose to be laid out. With a
+            # non-tty console the width is COLUMNS (the hook sets 150), and rich was wrapping
+            # the longest recipe mid-argument — `--vault \n Lab-Claude` — so the one line most
+            # likely to be copied verbatim was the one line that could not be. A wrapped recipe
+            # fails as a shell error attributable to the host, sending the reader to debug a
+            # login that was never actually attempted.
             for l in howto(r):
-                con.print("  " + ("[dim]" + l + "[/]" if l.lstrip().startswith("#") else l))
+                con.print("  " + ("[dim]" + l + "[/]" if l.lstrip().startswith("#") else l),
+                          soft_wrap=True)
 
     if SHOW_OTHERS:
         if not OFF_MEMBERS:
