@@ -872,6 +872,22 @@ def aruba_probe(user, host, pw, private_key=None):
                 pass
 
 
+def _undecorate(v):
+    """Strip what a copy-paste adds to a credential but a credential never contains.
+
+    Surrounding whitespace, and ONE matching pair of wrapping quotes. Nothing else -- this
+    must not become a place where a wrong value is massaged into a plausible one. It exists
+    because the estate has now produced three credentials that were correct and unusable:
+    the OPNsense key=/secret= prefix, the aruba key rendered quoted and newline-led by
+    --fields, and a PVE token id stored as '" claude@pve!mac01"'. Every one of them failed
+    as a 401 or a Permission denied, which is the far end saying no to something it was
+    never sent properly."""
+    v = (v or "").strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1].strip()
+    return v
+
+
 def auth_probe(r):
     """A REAL read-only login, using the host's own mechanism. Returns (ok|None, detail).
     None means 'cannot be tested', which is different from 'failed' and must stay different."""
@@ -913,10 +929,22 @@ def auth_probe(r):
             # PVE API token. The token id is not itself secret (it is USER@REALM!TOKENID);
             # the UUID is. Header form is fixed by Proxmox:
             #   Authorization: PVEAPIToken=USER@REALM!TOKENID=UUID
-            tid = (c.get("api_key") or c.get("username") or "").strip()
-            uuid = (c.get("api_secret") or c.get("password") or "").strip()
+            tid = _undecorate(c.get("api_key") or c.get("username") or "")
+            uuid = _undecorate(c.get("api_secret") or c.get("password") or "")
             if not (tid and uuid):
                 return None, "needs the token id (API Key) and its UUID (API Secret)"
+            # Check the SHAPE offline, before spending an auth attempt. A token id is
+            # USER@REALM!TOKENID and nothing else; a UUID is 8-4-4-4-12 hex. The first real
+            # one stored here arrived as '" claude@pve!mac01"' -- a leading space and a pair
+            # of wrapping quotes carried in with the paste -- and PVE answered 401, which is
+            # indistinguishable from a revoked token. Same family as the key=/secret= prefix
+            # and the quoted aruba key: the credential was correct and the FETCH was dirty.
+            # _undecorate strips the decoration; this says so when something is left that
+            # cannot be a token, rather than blaming the far end for refusing it.
+            if not re.fullmatch(r"[^\s@!]+@[^\s@!]+![^\s@!]+", tid):
+                return False, "token id is malformed — expected USER@REALM!TOKENID"
+            if not re.fullmatch(r"(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", uuid):
+                return False, "token secret is not a UUID — check the API Secret field"
             hdr = ["-H", f"Authorization: PVEAPIToken={tid}={uuid}"]
             got, body = curl(f"https://{host}:{r.get('port') or 8006}/api2/json/version", *hdr)
             if not got:
