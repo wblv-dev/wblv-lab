@@ -895,8 +895,20 @@ def auth_probe(r):
             if not got:
                 return None, "no answer from the API"
             j = json.loads(body or "{}")
-            v = j.get("product_version")
-            return (bool(v), f"OPNsense {v}" if v else "API rejected the credential")
+            if not j:
+                return None, "API answered with nothing parseable"
+            # Assert on the REJECTION, not on a version string at one fixed path. OPNsense
+            # says 401 / "Authentication Failed" in the body when it refuses; that is the
+            # only thing that means the credential is bad. Inferring failure from a missing
+            # field made a SCHEMA MOVE indistinguishable from a rejected login: 26.7 nested
+            # product_version inside "product", so a 200 carrying a valid payload rendered
+            # as "auth fail" three times across three sessions and sent us looking at a
+            # credential that was never involved. Read both paths; a version we cannot name
+            # is a gap in this tool's knowledge, not a gap in the login.
+            if j.get("status") == 401:
+                return False, "API rejected the credential"
+            v = (j.get("product") or {}).get("product_version") or j.get("product_version")
+            return True, f"OPNsense {v}" if v else "authenticated; firmware/status schema not recognised"
         if r["platform"] == "synology":
             u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
             # The port comes from the member, not from a literal. It was written here AND in
