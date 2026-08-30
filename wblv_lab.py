@@ -909,6 +909,41 @@ def auth_probe(r):
                 return False, "API rejected the credential"
             v = (j.get("product") or {}).get("product_version") or j.get("product_version")
             return True, f"OPNsense {v}" if v else "authenticated; firmware/status schema not recognised"
+        if r["platform"] == "proxmox":
+            # PVE API token. The token id is not itself secret (it is USER@REALM!TOKENID);
+            # the UUID is. Header form is fixed by Proxmox:
+            #   Authorization: PVEAPIToken=USER@REALM!TOKENID=UUID
+            tid = (c.get("api_key") or c.get("username") or "").strip()
+            uuid = (c.get("api_secret") or c.get("password") or "").strip()
+            if not (tid and uuid):
+                return None, "needs the token id (API Key) and its UUID (API Secret)"
+            hdr = ["-H", f"Authorization: PVEAPIToken={tid}={uuid}"]
+            got, body = curl(f"https://{host}:{r.get('port') or 8006}/api2/json/version", *hdr)
+            if not got:
+                return None, "no answer from the API"
+            try:
+                j = json.loads(body or "{}")
+            except ValueError:
+                return False, "API answered but not with JSON — check the token id form"
+            ver = (j.get("data") or {}).get("version")
+            if not ver:
+                return False, "API rejected the credential"
+            # /version needs only a valid token, so a 200 here proves the SECRET and nothing
+            # about the ACL. A privsep token with no `pveum acl modify` is the likeliest way
+            # to get this wrong, and it fails exactly like Jira's search endpoint: authorised,
+            # permission-filtered, and empty -- which reads as a healthy but idle cluster.
+            # /nodes needs Sys.Audit on /nodes, which is what PVEAuditor actually grants, so
+            # the two calls together separate "the secret works" from "it can read anything".
+            got_n, body_n = curl(f"https://{host}:{r.get('port') or 8006}/api2/json/nodes", *hdr)
+            try:
+                nodes = (json.loads(body_n or "{}").get("data") or []) if got_n else None
+            except ValueError:
+                nodes = None
+            if nodes is None:
+                return True, f"PVE {ver} (node list unreadable — ACL not checked)"
+            if not nodes:
+                return False, f"PVE {ver}: token valid but reads nothing — no PVEAuditor ACL"
+            return True, f"PVE {ver}, {len(nodes)} node{'s' if len(nodes) != 1 else ''}"
         if r["platform"] == "synology":
             u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
             # The port comes from the member, not from a literal. It was written here AND in
@@ -1731,6 +1766,15 @@ def howto(r):
                 f'S=$({OP} --fields label="API Secret" --reveal | sed \'s/^{sp}//\')',
                 f'curl -sk -u "$K:$S" https://{host}/api/core/firmware/status',
                 f'# the {kp}/{sp} prefix is IN the field value; unstripped it is a silent 401']
+    elif pf == "proxmox":
+        out += [f'TID=$({OP} --fields label="API Key" --reveal)      # USER@REALM!TOKENID',
+                f'UUID=$({OP} --fields label="API Secret" --reveal)',
+                f'curl -sk -H "Authorization: PVEAPIToken=$TID=$UUID" \\',
+                f'  https://{host}:{r.get("port") or 8006}/api2/json/version',
+                '# /version proves only that the SECRET is live: it needs no privilege.',
+                '#   Read /api2/json/nodes too — that needs Sys.Audit, which is what',
+                '#   PVEAuditor grants. A privsep token with no ACL returns 200 and an',
+                '#   EMPTY data array, which looks exactly like a cluster with no nodes.']
     elif pf == "synology":
         port = r.get("port") or 5001
         out += [f'U=$({op_value(OP, "username")})',
