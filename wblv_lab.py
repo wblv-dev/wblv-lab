@@ -1472,6 +1472,10 @@ rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 # Both are now DISCOVERED: the key from the site, the field ids by NAME. A customfield_10042
 # is meaningless on any other tenant and would silently read as empty rather than failing.
 JIRA_FIELDS = ("Lab ID", "Hands", "Last verified")
+# Page size asked for, and how many pages before the count becomes an admitted floor. The
+# server trims by response size and hands back fewer than asked with a token, so the real
+# bound is PAGES, not maxResults — 8 x 100 is ~4x the current board and still a fixed stop.
+JIRA_PAGE, JIRA_MAX_PAGES = 100, 8
 # Why a False came back. "The far end refused" and "you have two projects and have not said
 # which" are both False, but they send you to completely different places -- and a tool that
 # names the wrong cause is worse than one that says nothing.
@@ -1573,23 +1577,47 @@ def jira_snapshot(rows):
     # bounded by HISTORY rather than by outstanding work — it would have crossed any cap on
     # completed tasks alone, and the counts would then have quietly meant "open among the
     # first N". Open work is the thing that is actually bounded.
-    got, body = curl(f"https://{host}/rest/api/3/search/jql", "-G",
-                     "--data-urlencode",
-                     f"jql=project = {key} AND {only} AND statusCategory != Done"
-                     " ORDER BY created ASC",
-                     "--data-urlencode", "maxResults=200",
-                     "--data-urlencode", f"fields=summary,status,issuetype,issuelinks,parent,fixVersions,"
-                                     f"{FID['Lab ID']},{FID['Hands']},{FID['Last verified']}",
-                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
-    if not got:
-        return None
-    try:
-        j = json.loads(body or "{}")
-    except ValueError:
-        return None
-    issues = j.get("issues")
-    if issues is None:
-        return False                     # answered, but not with a result set: a refusal
+    # maxResults is a CEILING the server may ignore: it trims pages by response size. Asking
+    # for 200 returned 100 and a nextPageToken, so len(first page) was reported as the open
+    # count and under-read 135 open items as 100 — a third of the board missing, with the
+    # number rendered as confidently as any other. The cap was never the bound that mattered.
+    # So page until the token runs out, still bounded: a session hook must not become an
+    # unbounded paginator, but one that stops at the first page is not a counter at all.
+    # A later page that fails is NOT a failed probe — the earlier pages were really measured.
+    # It degrades to the floor the cap always promised, and truncated says so.
+    issues, tok, cut = [], None, False
+    for _ in range(JIRA_MAX_PAGES):
+        args = ["-G", "--data-urlencode",
+                f"jql=project = {key} AND {only} AND statusCategory != Done"
+                " ORDER BY created ASC",
+                "--data-urlencode", f"maxResults={JIRA_PAGE}",
+                "--data-urlencode", f"fields=summary,status,issuetype,issuelinks,parent,fixVersions,"
+                                f"{FID['Lab ID']},{FID['Hands']},{FID['Last verified']}"]
+        if tok:
+            args += ["--data-urlencode", f"nextPageToken={tok}"]
+        got, body = curl(f"https://{host}/rest/api/3/search/jql", *args,
+                         "--config", "-", stdin=f'user = "{user}:{k}"\n')
+        if not got:
+            if not issues:
+                return None
+            cut = True; break
+        try:
+            j = json.loads(body or "{}")
+        except ValueError:
+            if not issues:
+                return None
+            cut = True; break
+        page = j.get("issues")
+        if page is None:
+            if not issues:
+                return False             # answered, but not with a result set: a refusal
+            cut = True; break
+        issues += page
+        tok = j.get("nextPageToken")
+        if not tok:
+            break
+    else:
+        cut = bool(tok)                  # pages exhausted with a token still outstanding
 
     # Done is counted, never listed: the number is the only part anyone reads, and counting it
     # costs one call instead of paging through every task ever finished.
@@ -1604,10 +1632,11 @@ def jira_snapshot(rows):
         done_n = None                    # untested, and it says so rather than showing 0
 
     out = {"open": 0, "prog": 0, "done": done_n, "ready": [], "blocked": [], "mine": [],
-           # The endpoint is token-paginated and trims pages by RESPONSE SIZE, so a short page
-           # is not evidence of a complete set. Inferring completeness from len() turns a floor
-           # into a confident total with the warning silently off.
-           "truncated": bool(j.get("nextPageToken")) or j.get("isLast") is False,
+           # Set only where the paging loop actually stopped early — page budget spent with a
+           # token outstanding, or a later page that failed. Absence of a token is the ONLY
+           # evidence of a complete set: the endpoint trims by response size, so a short page
+           # proves nothing, and reading completeness off len() is what hid 35 open items.
+           "truncated": cut,
            "host": host}
     for i in issues:
         f = i["fields"]
@@ -1648,6 +1677,25 @@ def jira_snapshot(rows):
     return out
 
 
+def op_value(OP, label):
+    """The fetch for a field that a 1Password LOGIN item duplicates.
+
+    Every login item carries built-in `username` and `password` fields, and on this estate
+    they are EMPTY on all of them — the real values live in the item's ACCESS section as
+    `Username` / `Password`. `--fields label=password` matches case-insensitively and returns
+    the FIRST match, so it hands back the empty built-in and the recipe fails at the far end:
+    DSM answers 400, ssh prompts. Both look exactly like a wrong password, which sends you to
+    rotate a credential that was never broken.
+
+    Select on HAVING A VALUE rather than on position. The duplicate is the item's shape, not
+    one bad entry — nas-01, rpi-01 and wap-01 all carry it — so the recipe must survive it
+    whether or not the vault is ever tidied. Same reason aruba-switch reads --format json:
+    --fields is the fetch that looks ordinary and quietly returns the wrong thing."""
+    return (f'{OP} --format json --reveal '
+            f"""| jq -r '[.fields[] | select((.label|ascii_downcase)=="{label}") """
+            f"""| .value | select(. != null and . != "")][0] // empty'""")
+
+
 def howto(r):
     """The exact call that authenticates to this member, assembled from the same constants
     the probe uses and the same live member data everything else here reads.
@@ -1673,8 +1721,8 @@ def howto(r):
                 f'# the {kp}/{sp} prefix is IN the field value; unstripped it is a silent 401']
     elif pf == "synology":
         port = r.get("port") or 5001
-        out += [f'U=$({OP} --fields label=username --reveal)',
-                f'P=$({OP} --fields label=password --reveal)',
+        out += [f'U=$({op_value(OP, "username")})',
+                f'P=$({op_value(OP, "password")})',
                 f'curl -sk -G https://{host}:{port}/webapi/entry.cgi \\',
                 f'  --data-urlencode api=SYNO.API.Auth --data-urlencode version={DSM_AUTH_VERSION} \\',
                 f'  --data-urlencode method=login --data-urlencode session={DSM_SESSION} \\',
@@ -1700,14 +1748,14 @@ def howto(r):
                 '#   at operator (>), behind a keypress banner. Scripted use needs pexpect.']
     elif pf == "tplink-eap":
         opts = " ".join(f"-o {o}" for o in SSH_LEGACY_OPTS)
-        out += [f'P=$({OP} --fields label=password --reveal)',
+        out += [f'P=$({op_value(OP, "password")})',
                 # \\ in source = ONE literal backslash, the shell's line continuation. It was
                 # \\\\ here (two literal backslashes), which the shell reads as an escaped
                 # backslash and NOT a continuation — the recipe broke into two commands.
                 f"ssh {opts} \\", f"    {acct}@{host} '<command>'",
                 '# offers only legacy host keys and no setting to fix it; ask per-host, never globally']
     elif pf == "linux":
-        out += [f'P=$({OP} --fields label=password --reveal)',
+        out += [f'P=$({op_value(OP, "password")})',
                 f"ssh -o StrictHostKeyChecking=no {acct}@{host} '<command>'   # password auth"]
     elif pf == "jira":
         out += [f'T=$({OP} --fields label="API Key" --reveal)',
@@ -1844,7 +1892,8 @@ def render(rows, meta):
         _done = TASKS["done"]
         field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · "
                        + (f"{_done} done" if _done is not None else "[dim]- done[/]")
-                       + ("  [yellow](truncated at 200)[/]" if TASKS["truncated"] else ""))
+                       + (f"  [yellow](truncated — a floor, not a total)[/]"
+                          if TASKS["truncated"] else ""))
     con.print()
 
     def _howto_block():
