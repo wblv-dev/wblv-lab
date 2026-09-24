@@ -138,8 +138,6 @@ HELP = """wblv-lab — what is alive in the lab, and how to reach it.
   wblv-lab --json       machine-readable
   wblv-lab --others     what is on the wire that the directory does NOT claim
   wblv-lab --howto      the exact call that logs in to each member\n  wblv-lab --howto nas-01  just that one\n  wblv-lab --brief      counts + Members + only what is NOT normal (what the hook reads)
-  wblv-lab --tasks      swap the member table for open work (jsm-01)
-  wblv-lab --tasks 1a.5 resolve one task by its Lab ID
   wblv-lab --test       every view in turn, from a single probe pass
   wblv-lab -h           this text
 
@@ -196,7 +194,7 @@ if {"-h", "--help", "help"} & set(sys.argv[1:]):
 
 # ⚠ deliberate — unknown flags die loud, an unrecognised flag used to be silently ignored,
 # see NOTES.md#unknown-flag-dies
-KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "--howto", "--others",
+KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--howto", "--others",
          "-h", "--help", "help"}
 _bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN]
 if _bad:
@@ -222,14 +220,15 @@ SHOW_BRIEF = "--brief" in sys.argv
 # deliberate — recipes live in the session brief, not behind a flag, see NOTES.md#howto-always-shown
 SHOW_HOWTO = "--howto" in sys.argv
 
-# same slot/reasoning as --check and --tasks — "what do I have" vs "what's here that I don't"
+# same slot/reasoning as --check — "what do I have" vs "what's here that I don't"
 SHOW_OTHERS = "--others" in sys.argv
 
 # no -j alias — would shadow --json's short form and pipe a Rich table into a JSON parser
-SHOW_TASKS = "--tasks" in sys.argv
-# one positional, shared by --tasks/--howto, guarded so a bare `wblv-lab foo` can't silently filter
-TASK_ID = (next((a for a in sys.argv[1:] if not a.startswith("-")), None)
-           if (SHOW_TASKS or SHOW_HOWTO) else None)
+
+# one positional, narrowing --howto to a single member; guarded so a bare `wblv-lab foo`
+# cannot silently filter the table
+ONLY_ID = (next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+           if SHOW_HOWTO else None)
 
 
 # --- 1Password substrate ------------------------------------------------------------------
@@ -1210,181 +1209,6 @@ with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; 
     rows = list(ex.map(probe, _classified))
 rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 
-# ---------------------------------------------------------------- Jira task snapshot -----
-# jsm-01 is a member like any other; its task state is member DETAIL, read live, stored nowhere.
-# ⚠ deliberate — None for UNTESTED, never a zeroed dict; project key/field ids DISCOVERED,
-# never hardcoded, see NOTES.md#jira-snapshot-design
-JIRA_FIELDS = ("Lab ID", "Hands", "Last verified")
-# deliberate — real bound is PAGES not maxResults, see NOTES.md#jira-page-bound
-JIRA_PAGE, JIRA_MAX_PAGES = 100, 8
-TASKS_WHY = []      # why a False came back — different causes need different fixes
-
-
-def esc(t):
-    """Jira text is user-supplied and Rich treats [...] as markup."""
-    from rich.markup import escape
-    return escape(str(t or ""))
-
-def jira_snapshot(rows):
-    """One call, everything computed here. Returns None if there is no jira member or the
-    API did not answer; a dict otherwise. Blocked-ness is derived from real issue links, not
-    from prose, which is the whole reason task state left markdown."""
-    # deliberate — given the UNFILTERED member list, see NOTES.md#jira-snapshot-unfiltered
-    m = next((r for r in rows if r["platform"] == "jira"), None)
-    if not m:
-        return None
-    c = CREDS.get(m["id"], {})
-    user, k = c.get("username") or "", c.get("api_key") or c.get("password") or ""
-    host = re.sub(r"^[a-z]+://", "", (m.get("endpoint") or "")).split("/")[0].strip()
-    if not (user and k and host):
-        return None
-    # ⚠ deliberate — this thread must set _CUR.id itself, see NOTES.md#jira-snapshot-note-op
-    _CUR.id = m["id"]
-    # WORK = hierarchyLevel 0, filtered by TYPE ID not name. Project discovered, not named —
-    # see NOTES.md#jira-project-discovery
-    got, body = curl(f"https://{host}/rest/api/3/project/search?maxResults=50",
-                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
-    if not got:
-        return None
-    try:
-        projects = json.loads(body or "{}").get("values") or []
-    except ValueError:
-        return None
-    declared = (c.get("project") or "").strip()
-    if declared:
-        proj = next((p for p in projects if p.get("key") == declared), None)
-        if not proj:
-            TASKS_WHY.append(f"the item declares project {declared!r}, which this credential cannot see")
-            return False
-    elif len(projects) == 1:
-        proj = projects[0]
-    elif not projects:
-        # ⚠ A permission-filtered read returns 200 with an empty list, so "no projects" and
-        # "this token may no longer see them" are the same bytes. AUTH proves the login, never
-        # the visibility — say both, and never advise a vault edit that cannot help.
-        TASKS_WHY.append("this credential sees no projects — either the site has none, or the "
-                         "token's scope was reduced. AUTH proves the login, not the visibility")
-        return False
-    else:
-        TASKS_WHY.append(f"{len(projects)} projects visible and the vault item names none — "
-                         f"add a Project field to the item ({', '.join(p['key'] for p in projects[:6])})")
-        return False
-    key = proj["key"]
-
-    got, body = curl(f"https://{host}/rest/api/3/project/{key}",
-                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
-    if not got:
-        return None
-    try:
-        work_ids = [t["id"] for t in json.loads(body or "{}").get("issueTypes", [])
-                    if t.get("hierarchyLevel") == 0]
-    except ValueError:
-        return None
-    if not work_ids:
-        # completed transfer, no work types = far end saying no — must be False, not None
-        return False
-    only = f"issuetype in ({', '.join(work_ids)})"
-
-    got, body = curl(f"https://{host}/rest/api/3/field",
-                     "--config", "-", stdin=f'user = "{user}:{k}"\n')
-    if not got:
-        return None
-    try:
-        by_name = {f.get("name"): f.get("id") for f in json.loads(body or "[]")}
-    except ValueError:
-        return None
-    FID = {n: by_name.get(n) for n in JIRA_FIELDS}
-    if not FID["Lab ID"]:
-        # without it every task falls back to its Jira key and the vault's 1a.5 refs stop resolving
-        TASKS_WHY.append("the Jira site has no custom field named 'Lab ID' — task ids would "
-                         "fall back to Jira keys and the vault's references would stop resolving")
-        return False
-
-    # ⚠ deliberate — OPEN work only, paged until token exhausted, not by maxResults alone,
-    # see NOTES.md#jira-pagination-truncation
-    issues, tok, cut = [], None, False
-    for _ in range(JIRA_MAX_PAGES):
-        args = ["-G", "--data-urlencode",
-                f"jql=project = {key} AND {only} AND statusCategory != Done"
-                " ORDER BY created ASC",
-                "--data-urlencode", f"maxResults={JIRA_PAGE}",
-                "--data-urlencode", f"fields=summary,status,issuetype,issuelinks,parent,fixVersions,"
-                                f"{FID['Lab ID']},{FID['Hands']},{FID['Last verified']}"]
-        if tok:
-            args += ["--data-urlencode", f"nextPageToken={tok}"]
-        got, body = curl(f"https://{host}/rest/api/3/search/jql", *args,
-                         "--config", "-", stdin=f'user = "{user}:{k}"\n')
-        if not got:
-            if not issues:
-                return None
-            cut = True; break
-        try:
-            j = json.loads(body or "{}")
-        except ValueError:
-            if not issues:
-                return None
-            cut = True; break
-        page = j.get("issues")
-        if page is None:
-            if not issues:
-                return False             # answered, but not with a result set: a refusal
-            cut = True; break
-        issues += page
-        tok = j.get("nextPageToken")
-        # deliberate — isLast is a second, independent truncation signal: a degenerate but
-        # documented-possible response can carry isLast:false with no nextPageToken. Reading
-        # completeness off the token alone would then report a short page as the full set.
-        if j.get("isLast") is False and not tok:
-            cut = True
-            break
-        if not tok:
-            break
-    else:
-        cut = bool(tok)                  # pages exhausted with a token still outstanding
-
-    # done counted, never listed — one call instead of paging through every finished task
-    dgot, dbody = curl(f"https://{host}/rest/api/3/search/approximate-count",
-                       "-X", "POST", "-H", "Content-Type: application/json",
-                       "-d", json.dumps({"jql": f"project = {key} AND {only}"
-                                                " AND statusCategory = Done"}),
-                       "--config", "-", stdin=f'user = "{user}:{k}"\n')
-    try:
-        done_n = json.loads(dbody or "{}").get("count") if dgot else None
-    except ValueError:
-        done_n = None                    # untested, and it says so rather than showing 0
-
-    out = {"open": 0, "prog": 0, "done": done_n, "ready": [], "blocked": [], "mine": [],
-           "truncated": cut,      # see NOTES.md#jira-pagination-truncation
-           "host": host}
-    for i in issues:
-        f = i["fields"]
-        cat = f["status"]["statusCategory"]["key"]
-        labid = f.get(FID["Lab ID"]) or i["key"]
-        hands = (f.get(FID["Hands"]) or {}).get("value") or "-"
-        out["prog" if cat == "indeterminate" else "open"] += 1
-        # ⚠ deliberate — inwardIssue is the BLOCKER side, verified against raw links,
-        # see NOTES.md#jira-link-direction
-        waits = [l["inwardIssue"] for l in (f.get("issuelinks") or [])
-                 if l["type"]["inward"] == "is blocked by" and l.get("inwardIssue")
-                 and l["inwardIssue"]["fields"]["status"]["statusCategory"]["key"] != "done"]
-        # esc() — Jira text is user-supplied and Rich treats [...] as markup
-        row = {"id": esc(labid), "key": i["key"], "hands": hands,
-               "scope": esc(((f.get("parent") or {}).get("fields") or {}).get("summary", "").split(" —")[0]),
-               "phase": ((f.get("fixVersions") or [{}])[0] or {}).get("name", "")[:2],
-               "summary": esc(f["summary"].split("— ", 1)[-1]),
-               "waits": [w["key"] for w in waits]}
-        if waits:
-            out["blocked"].append(row)
-        else:
-            out["ready"].append(row)
-            if hands == "Claude":
-                out["mine"].append(row)
-    # translate Jira keys to Lab IDs — a runbook says "1e.1", not "LAB-6"
-    key2id = {i["key"]: (i["fields"].get(FID["Lab ID"]) or i["key"]) for i in issues}
-    for r in out["blocked"]:
-        r["waits"] = [key2id.get(k, k) for k in r["waits"]]
-    return out
-
 
 def op_value(OP, label):
     """The fetch for a field that a 1Password LOGIN item duplicates — built-in username/password
@@ -1503,19 +1327,6 @@ def faults_of(r):
                              ("dup", r.get("name_collision"))) if bad]
 
 
-# lazy (no task fields in --json) and guarded (one bad Jira payload must not take the whole run down)
-_TASKS_CACHE = []
-
-
-def tasks_snapshot():
-    if not _TASKS_CACHE:
-        try:
-            _TASKS_CACHE.append(jira_snapshot(_all))   # _all, not rows: see below
-        except Exception:
-            _TASKS_CACHE.append(None)                  # untested, never a traceback
-    return _TASKS_CACHE[0]
-
-
 def render(rows, meta):
     """A table for humans. Colour encodes STATE only — green up, red down, dim untested; every
     glyph maps to a measured value, none of it is commentary. Counts sit ABOVE the table since
@@ -1562,31 +1373,13 @@ def render(rows, meta):
     _faulted = sum(1 for r in rows if faults_of(r))
     field("Faults", _faulted, "red" if _faulted else "")
     field("Non-members", meta["off_directory"])
-    # UNTESTED prints a dash, same as REACH/AUTH — a Jira outage must never render as "0 open"
-    TASKS = tasks_snapshot()
-    # deliberate — re-read check/probe_ops, task calls happen after the pool joins,
-    # see NOTES.md#jira-probe-ops-reread
-    for _r in rows:
-        if _r.get("platform") == "jira":
-            _r["probe_ops"] = list(PROBE_OPS.get(_r["id"]) or [])
-            _r["check"] = describe_check(_r)
-    if TASKS is None:
-        field("Tasks", "-", "dim")
-    elif TASKS is False:
-        field("Tasks", f"unavailable — {TASKS_WHY[0] if TASKS_WHY else 'far end refused'}", "red")
-    else:
-        _done = TASKS["done"]
-        field("Tasks", f"{TASKS['open']} open · {TASKS['prog']} in progress · "
-                       + (f"{_done} done" if _done is not None else "[dim]- done[/]")
-                       + (f"  [yellow](truncated — a floor, not a total)[/]"
-                          if TASKS["truncated"] else ""))
     con.print()
 
     def _howto_block():
         con.print()
         con.print("[bold]How to authenticate[/] — exact calls, generated from the probes. "
                   "Read before connecting.")
-        want = TASK_ID  # reuse the positional: --howto nas-01
+        want = ONLY_ID
         for r in rows:
             if want and r["name"] != want:
                 continue
@@ -1645,59 +1438,6 @@ def render(rows, meta):
                       + (f", [red]fault {','.join(fl)}[/]" if fl else "")
                       + f"   {r.get('access') or '-'}   {r['item']}")
         if SHOW_HOWTO: _howto_block()
-        return
-
-    if SHOW_TASKS:
-        if TASKS is None:
-            con.print("[dim]tasks UNTESTED — no answer from jsm-01. Not the same as no tasks.[/]")
-            return
-        if TASKS is False:
-            why = TASKS_WHY[0] if TASKS_WHY else ("jsm-01 answered but the task plane could "
-                                                  "not be resolved")
-            con.print(f"[red]tasks FAILED — {why}[/]")
-            return
-        DASH = "[grey35]-[/]"
-        if TASK_ID:
-            # one record as fields, not a one-row table; accepts the Jira key too (WAITS ON can print one)
-            hit = [r for r in TASKS["ready"] + TASKS["blocked"]
-                   if TASK_ID.lower() in (r["id"].lower(), r["key"].lower())]
-            if not hit:
-                con.print(f"[dim]no OPEN task with Lab ID {TASK_ID}. It may be done, or the id may be"
-                          f" wrong — those are different, so check before assuming.[/]")
-                return
-            for r in hit:
-                con.print(f"[bold]{r['id']}[/]  {r['summary']}")
-                field("Scope", r["scope"] or DASH)
-                field("Phase", r["phase"] or DASH)
-                field("Hands", r["hands"])
-                field("Jira", r["key"])
-                field("Waits on", ", ".join(r["waits"]) if r["waits"] else DASH,
-                      "yellow" if r["waits"] else "")
-            return
-        # deliberate — one table, STATE as a scannable column, see NOTES.md#tasks-one-table
-        t = Table(box=box.SIMPLE, show_edge=False, header_style="bold", border_style="grey35",
-                  pad_edge=False, padding=(0, 1))
-        t.add_column("TASK", style="bold", no_wrap=True)
-        t.add_column("PH", no_wrap=True)
-        t.add_column("SCOPE", no_wrap=True)
-        t.add_column("HANDS", no_wrap=True)
-        t.add_column("STATE", justify="center", no_wrap=True, min_width=7)
-        # blank unless something is holding this up — same reasoning as FAULT
-        t.add_column("WAITS ON", style="yellow", no_wrap=True)
-        t.add_column("SUMMARY", style="cyan")
-        HANDS = {"Claude": "cyan", "Harry": "default", "Either": "magenta"}
-        for r in sorted(TASKS["ready"], key=lambda x: (x["phase"], x["id"])) + \
-                 sorted(TASKS["blocked"], key=lambda x: (x["phase"], x["id"])):
-            t.add_row(r["id"], r["phase"] or DASH, r["scope"] or DASH,
-                      f"[{HANDS.get(r['hands'],'yellow')}]{r['hands']}[/]",
-                      "[green]ready[/]" if not r["waits"] else "[yellow]blocked[/]",
-                      ", ".join(r["waits"]) or "",
-                      r["summary"])
-        probe = Console(width=10_000, no_color=True)
-        natural = Measurement.get(probe, probe.options, t).maximum
-        out = con if natural <= con.width else Console(width=natural, highlight=False)
-        rule = "[grey35]" + "─" * natural + "[/]"
-        out.print(rule); out.print(t); out.print(rule)
         return
 
     # deliberate — SIMPLE/no-edge is the only box starting at column 0, see NOTES.md#table-box-choice
@@ -1790,18 +1530,6 @@ if __name__ == "__main__":
         print(f"\n{'=' * 78}\n$ wblv-lab --brief\n{'=' * 78}")
         render(shown, meta)
         SHOW_BRIEF = False
-        SHOW_TASKS = True
-        print(f"\n{'=' * 78}\n$ wblv-lab --tasks\n{'=' * 78}")
-        render(shown, meta)
-        # real id from the snapshot, not hardcoded — a literal rots the first time that task closes
-        _t = tasks_snapshot()
-        _id = (_t["ready"] + _t["blocked"])[0]["id"] if isinstance(_t, dict) and (_t["ready"] or _t["blocked"]) else None
-        if _id:
-            TASK_ID = _id
-            print(f"\n{'=' * 78}\n$ wblv-lab --tasks {_id}\n{'=' * 78}")
-            render(shown, meta)
-            TASK_ID = None
-        SHOW_TASKS = False
         print(f"\n{'=' * 78}\n$ wblv-lab --json\n{'=' * 78}")
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON}
                                               for r in shown]}, indent=2))
