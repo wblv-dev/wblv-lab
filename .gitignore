@@ -14,3 +14,6 @@ __pycache__/
 
 # macos
 .DS_Store
+
+# local backup copies — the repo is the history
+*.bk

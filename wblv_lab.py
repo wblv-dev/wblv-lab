@@ -1,20 +1,7 @@
 #!/usr/bin/env -S uv run --with pexpect<5 --with rich<16 --quiet --script
 """wblv-lab — what is alive in the lab, and how to reach it.
 
-A directory, not a broker. It reports members, their state and their access route, then
-gets out of the way: you connect to the host yourself using the credential it names.
-
-Authorities, in order of use:
-  1Password   membership. A vault item IS what makes something a lab member — so onboarding
-              is data, not code, and non-members (workstation, control node) never appear.
-  OPNsense    detail. Dnsmasq reservations are the IPAM; ARP supplies the live vendor string.
-  the network everything else: reachability and a real login are measured, never recorded.
-
-Nothing here is cached, and nothing about THIS lab is written down: no address, no hostname,
-no naming convention. Every member, and the router that supplies the inventory, is found by
-what its vault item declares it is. What remains in code is knowledge of vendors' APIs — the
-dialect each platform speaks, and where its endpoint lives — which changes when a vendor
-changes, not when Harry renames a box.
+Design rationale and incident history: see README.md and NOTES.md.
 """
 import os, sys, json, re, base64, socket, subprocess, tempfile, threading, time, datetime
 try:
@@ -27,61 +14,30 @@ _T0 = time.time()          # for the Runtime stat: measured, not estimated
 
 TOKEN_PATH = os.path.expanduser("~/.config/wblv/op-token")
 
-# Platforms whose API can serve the lab's IPAM. This is a VENDOR fact — "can I read Dnsmasq
-# reservations from this dialect" — not a fact about Harry's lab, which is why it survives him
-# renaming or replacing the box. The router used to be found by a three-character hostname
-# prefix, which meant a rename or a swap to pfSense did not degrade the tool, it killed it,
-# and the assumption was invisible: buried in a next() rather than declared.
-#
-# Everything else a member needs — its role, its API dialect, its scheme and port — now comes
-# from its own vault item. There is no prefix table any more, so onboarding any device of any
-# type is entirely data: create the item, and it appears.
+# Platforms whose API can serve the lab's IPAM — a vendor fact, not a Harry-lab fact.
+# deliberate — replaced a hostname-prefix table, see NOTES.md#ipam-platform-prefix-table
 IPAM_PLATFORMS = ("opnsense",)
 
 # Credentials are held OUT of the member records so they cannot reach stdout. Output rows are
 # built from an explicit whitelist below; a secret must never be one accidental print away.
 CREDS = {}
 
-# Item ids whose probe authenticated with a credential this MACHINE holds rather than the one
-# the vault item carries. The row's whole claim is "this item opens it", so a green AUTH that
-# actually proves `gh`'s local token works is the row asserting something untested. Surfaced
-# as a fault, because the qualifier in auth_detail never reaches the table.
+# Item ids whose auth actually used a credential this MACHINE holds, not the vault's own —
+# surfaced as the 'cred' fault, since the row's claim is "this item opens it".
 CRED_FALLBACK = set()
 
-# Vendor strings OPNsense resolves from the OUI. Matched on the NAME the router reports, not
-# on a local OUI table — the lookup is the device's, we only classify the answer.
-# Roles whose auth probe talks to no host, so neither an endpoint nor a successful REACH is a
-# precondition for testing them. Kept explicit: the default stays "do not attempt a login
-# against something that did not answer", which is what stops repeated probes tripping lockouts.
-# github belongs here for the same reason: its probe hardcodes api.github.com, so an item
-# carrying only a token — or one whose URL slot holds labelled data rather than a link, the
-# shape the M365 item already had — needs no endpoint to be testable. Without this it was
-# dropped before any probe ran and read as permanently untested.
+# Vendor strings resolved from the router's OUI lookup, not a local table.
+# deliberate — roles whose probe talks to no host, so REACH is not a precondition,
+# see NOTES.md#hostless-roles
 HOSTLESS_ROLES = ("1password", "github")
 
-# OAuth's own names for "this is us, not you" (RFC 6749 §5.2 plus Azure's spelling). A token
-# endpoint that answers with one of these has NOT rejected the credential, so the probe must
-# report untested rather than failed — otherwise a provider-side wobble reads as a dead secret
-# and the fix looks like "rotate the credential", which is both wrong and destructive.
+# RFC 6749 §5.2 (plus Azure's spelling) for "this is us, not you" — NOT a rejection.
+# deliberate — misreading these as failed sends Harry rotating a live secret, see NOTES.md#transient-oauth
 TRANSIENT_OAUTH = ("temporarily_unavailable", "server_error", "slow_down")
 
-# What each probe actually DID. ACCESS answers "how do I get in" and is the URI you connect
-# to; for a service that is the admin console, which is deliberately NOT what the probe talks
-# to — nobody logs in to api.github.com. Sitting next to REACH and AUTH, ACCESS reads as the
-# thing those columns measured, and for a service it never was. `--check` swaps the column so
-# the mechanism is legible instead of implied.
-#
-# RECORDED, not described. A hand-written table of what each probe does is a fact that goes
-# stale silently: add an omada probe and it says "no probe"; 1Password changes its verb and
-# it still claims the old one. Same failure as writing a device's address into a note.
-#
-# So the probe helpers append what they ACTUALLY did, keyed by the member being probed, and
-# CHECK is read back from that. A member with nothing recorded gets "" -> "-", which is the
-# truth: nothing was checked. Adding a probe makes its row describe itself with no second
-# place to update.
-#
-# Only the operation is recorded, never its credentials — the URL without its query string,
-# the command without its arguments. Same rule as the output whitelist.
+# What each probe actually DID, recorded rather than hand-described so it can't go stale.
+# CHECK is read back from this; --check swaps it in for ACCESS. Never records credentials.
+# deliberate — see NOTES.md#probe-ops-recorded-not-described
 PROBE_OPS = {}
 _CUR = threading.local()
 
@@ -95,10 +51,7 @@ def note_op(text):
         if text not in PROBE_OPS[mid]:      # a retry is the same check, not a second one
             PROBE_OPS[mid].append(text)
 
-# 1Password's own UI names some things for you (a Login item always carries username/password;
-# autofill leaves newUserName behind), and the same value has been written under different
-# labels over time. Aliases are ADDITIVE — the original label is kept too — so tidying an item
-# can never break the tool, and items can be migrated one at a time rather than in lockstep.
+# 1Password/autofill label variants, folded to one canonical name. ADDITIVE — original kept too.
 ALIASES = {
     "newusername": "username", "user": "username", "login": "username",
     "pass": "password", "passwd": "password",
@@ -124,11 +77,7 @@ EXPIRY_WARN_DAYS = 45
 
 def _expiry_days(value):
     """Days until a recorded credential expiry, or None if none is recorded or it is unparseable.
-
-    Day-first, because that is how the vault's dates are written (23/07/2028) and how Harry
-    types them. Guessing month-first would silently move a date by up to eleven months and
-    still look like a valid answer -- so an unrecognised string returns None and says nothing,
-    rather than inventing a deadline. ISO is accepted too, being unambiguous."""
+    Day-first parsing — deliberate, see NOTES.md#day-first-dates"""
     value = (value or "").strip()
     if not value:
         return None
@@ -150,24 +99,16 @@ def _field(full, *names):
     return next((f.get("value").strip() for f in (full.get("fields") or [])
                  if _fold(f.get("label")) in want and (f.get("value") or "").strip()), "")
 
-# Explicit whitelist for --json: credentials live in CREDS and must never be one careless
-# print away. reach_basis says WHICH measurement produced REACH — "endpoint" (the address
-# answered), "tenant" (a tenant-scoped call answered), "derived" (the auth probe reached it,
-# and nothing weaker could) or "untested" (nothing could be measured). Two rows both reading
-# reach:true are not making the same claim, and a machine consuming this should be able to
-# tell. It is never absent and never empty: a consumer branching on the set would otherwise
-# default an unmeasured member into whichever bucket it happened to fall through to.
+# Explicit whitelist for --json — credentials live in CREDS, never here.
+# reach_basis: WHICH measurement produced REACH — "endpoint" | "tenant" | "derived" | "untested".
+# Never absent/empty: see NOTES.md#reach-basis
 KEEP_JSON = ("name", "type", "source", "type_drift", "fqdn", "ip", "mac", "vendor", "role",
              "access", "check", "probe_ops", "reach", "reach_basis", "auth", "auth_detail",
              "item", "account", "endpoint", "endpoint_malformed", "access_unreachable",
-             # arp_seen says whether the router could see this member at all. Without it,
-             # ip_drift:null and zone:"" are ambiguous — a service legitimately has neither,
-             # and a machine whose ARP entry aged out has neither for a very different reason.
+             # arp_seen distinguishes "no ARP entry" from "legitimately nothing" — see NOTES.md#arp-seen
              "cred_fallback", "zone", "arp_seen", "live_ip", "ip_drift", "platform",
              "name_collision",
-             # Both spellings are kept, not just the winner: a `name` fault says the two
-             # disagree, and the consumer cannot act on that without seeing each of them.
-             # cred_expiry is days remaining — negative means already expired.
+             # declared_name/derived_name both kept — see NOTES.md#declared-vs-derived-name
              "declared_name", "derived_name", "name_mismatch", "cred_expiry")
 
 HYPERVISORS = ("proxmox", "vmware", "qemu", "kvm", "xen", "microsoft corporation",
@@ -249,16 +190,12 @@ of the wire this directory accounts for; it is not a fault.
 This tool tells you which credential opens a host. It does not turn the key — you connect
 and run commands yourself, so the read-only limit lives in the host account."""
 
-# Both are read before any work is done. Printing help used to cost a full probe run, and a
-# filtered view used to probe every host and then throw most of the results away — the flags
-# were parsed in __main__, which runs last.
+# read before any work is done, deliberately — printing help used to cost a full probe run
 if {"-h", "--help", "help"} & set(sys.argv[1:]):
     print(HELP); sys.exit(0)
 
-# An unrecognised flag used to be IGNORED, so `wblv-lab --breif` printed the full table and
-# said nothing -- you asked for one view and silently got another. That is the same defect the
-# whole tool is built against, sitting in its own argument parsing. Typos are the common case
-# and they are exactly when a confident wrong answer does the most damage.
+# ⚠ deliberate — unknown flags die loud, an unrecognised flag used to be silently ignored,
+# see NOTES.md#unknown-flag-dies
 KNOWN = {"-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--tasks", "--howto", "--others",
          "-h", "--help", "help"}
 _bad = [a for a in sys.argv[1:] if a.startswith("-") and a not in KNOWN]
@@ -270,56 +207,33 @@ WANT = ({"physical"} if "-p" in sys.argv else set()) | \
        ({"virtual"} if "-v" in sys.argv else set()) | \
        ({"service"} if "-s" in sys.argv else set())
 
-# MAC is the widest column that answers a question nobody asks at a glance: it identifies a
-# NIC, where every other column answers "is the lab healthy and how do I get in". It cost 20
-# columns and pushed the table past the ~120 the comment below the table warns about — three
-# additions (FAULT, ZONE, services-as-members) took the natural width from 119 to 138, so a
-# terminal that used to fit stopped fitting without changing size. Hidden here, never dropped:
-# --json still carries it, because a machine has no width limit.
+# hidden by default (costs 20 columns); --json always carries it — see NOTES.md#show-mac-width
 SHOW_MAC = "--mac" in sys.argv
 
-# Swaps the ACCESS column for CHECK rather than adding one — same slot, so the table stays at
-# its width. The two answer different questions and only a machine wants both at once, which
-# is what --json is for.
+# same slot as ACCESS, not an added column, so the table stays at its width
 SHOW_CHECK = "--check" in sys.argv
 
-# Every view from one probe pass, so a whole-surface check can be pasted into a conversation
-# without running the probes nine times.
+# every view from one probe pass, so a whole-surface check needs one paste, not nine runs
 SHOW_TEST = "--test" in sys.argv
 
-# Swaps the member table for the task table — same slot, same reasoning as --check. "What is
-# alive" and "what should I do next" are different questions; the default answers the first.
-# An argument after the flag resolves ONE Lab ID, which is the lookup that would otherwise be
-# six lines of curl assembled by hand every time.
-# Exceptions only. Ten rows that all say "fine" carry one bit between them, and a wall of
-# green teaches the reader to skim -- which is how a silently truncated session hook went
-# unnoticed for days. The counts still ASSERT health positively, so "all fine" and "the probe
-# never ran" stay distinguishable; health is never implied by the absence of rows.
+# deliberate — exceptions only, a wall of green teaches skimming, see NOTES.md#show-brief-exceptions
 SHOW_BRIEF = "--brief" in sys.argv
 
-# The recipes go in the session brief rather than behind a flag, because the evidence is that
-# a flag I have been told about is still a flag I do not reach for: every one of these logins
-# was got wrong by hand while the ACCESS URI and credential item were already in context.
-# Knowing WHERE was never the problem.
+# deliberate — recipes live in the session brief, not behind a flag, see NOTES.md#howto-always-shown
 SHOW_HOWTO = "--howto" in sys.argv
 
-# Swaps the member table for what is on the wire and NOT in the directory. Same slot, same
-# reasoning as --check and --tasks: "what do I have" and "what is here that I do not have"
-# are different questions, and the default answers the first.
+# same slot/reasoning as --check and --tasks — "what do I have" vs "what's here that I don't"
 SHOW_OTHERS = "--others" in sys.argv
 
-# No -j alias: it shadowed the obvious short form of --json and would have piped a Rich table
-# into a JSON parser, passing the unknown-option guard on the way.
+# no -j alias — would shadow --json's short form and pipe a Rich table into a JSON parser
 SHOW_TASKS = "--tasks" in sys.argv
-# One positional, shared by the two flags that take one. Guarded on either being present so
-# a bare `wblv-lab foo` cannot silently become a filter for something.
+# one positional, shared by --tasks/--howto, guarded so a bare `wblv-lab foo` can't silently filter
 TASK_ID = (next((a for a in sys.argv[1:] if not a.startswith("-")), None)
            if (SHOW_TASKS or SHOW_HOWTO) else None)
 
 
 # --- 1Password substrate ------------------------------------------------------------------
-# Prove the token and 1P are usable ONCE, up front. Otherwise a single substrate fault shows
-# up as N cascading per-host failures that bury the actual cause.
+# proved once, up front — one substrate fault must not read as N cascading host failures
 try:
     TOKEN = open(TOKEN_PATH).read().strip()
 except OSError as e:
@@ -378,101 +292,46 @@ def _member(item):
             [f.get("value") or "" for f in (full.get("fields") or [])
              if "://" in (f.get("value") or "")]
     href = ";".join(slots)
-    # The URL is also kept WHOLE, not just parsed for scheme/host/port. Rebuilding it from
-    # those three threw the path away, so an item saying https://github.com/wblv-dev was
-    # reported as https://github.com:443 — a connect target less useful than the field it
-    # came from, and a port number nobody typed. A host's URI is still rebuilt from the IPAM
-    # (which is authoritative for its name); a service has no IPAM, so the vault URL as
-    # written is the only truth there is.
+    # deliberate — URL kept whole, not rebuilt from parts, see NOTES.md#url-kept-whole
     website = next((s.strip() for s in slots if "://" in s), "")
     # Any scheme, not just http(s): an SSH-managed host should be able to say so, rather than
     # being described by a web URL it does not serve. The scheme is how you reach it.
     m = re.search(r"([a-z][a-z0-9+.\-]*)://([A-Za-z0-9.\-]+)(?::(\d+))?", href, re.I)
-    # A URL field holding something that is not a hostname is a data fault in the vault, not
-    # something to coerce. Reported as such rather than silently parsed into nonsense — the
-    # M365 item holds an expiry date and two GUIDs here, which once parsed as a host named "23".
+    # deliberate — malformed URL is reported, never coerced, see NOTES.md#m365-host-named-23
     endpoint = m.group(2) if (m and "." in m.group(2)) else ""
-    # A missing endpoint is only a FAULT if something was clearly meant to be one. An item
-    # whose only URL-slot entries are labelled data (role: 1password) has no endpoint because it
-    # needs none — reporting that as a malformed URL would be the tool inventing a problem.
-    #
-    # ⚠ This looked only at `urls`, and every item in the vault has an EMPTY urls array — the
-    # Website is a labelled FIELD. So `intended` was always False and the 'url' fault could not
-    # fire on any member that exists: a malformed Website would have rendered exactly like a
-    # service that legitimately has none. A check that cannot fail and a check that passes are
-    # the same silence, which is the failure mode this tool exists to refuse. Both slots now count.
+    # ⚠ deliberate — a check that could never fire, see NOTES.md#url-fault-could-never-fire
     intended = any(("://" in (u.get("href") or "")) or
                    _fold(u.get("label")) in ("website", "url")
                    for u in (full.get("urls") or [])) or \
                bool(_field(full, "website", "url", "endpoint"))
     junk = intended and not endpoint
-    # A service has no meaningful hostname prefix — a SaaS tenant is not identified by the
-    # first three letters of its portal's DNS name — so the URL is the only thing that states
-    # how to reach it. Read the scheme and port from it rather than inferring them.
+    # A service's URL is the only thing that states how to reach it — read scheme/port from it.
     scheme = (m.group(1).lower() if endpoint else "")
     DEFAULT_PORT = {"https": 443, "http": 80, "ssh": 22}
     url_port = (int(m.group(3)) if (endpoint and m.group(3))
                 else DEFAULT_PORT.get(scheme) if endpoint else None)
-    # A set value never loses to an empty one — the same rule the credential map applies below.
-    # 1Password's built-in username field exists whether or not it is filled, so an item that
-    # carries its account in a named section would show a blank ACCOUNT purely because the empty
-    # built-in comes first in the array. That is luck, not design, and it made the one migrated
-    # item look accountless next to the seven that had not been touched yet.
+    # deliberate — a set value never loses to an empty one, see NOTES.md#set-value-wins-empty
     user = next((f.get("value") for f in (full.get("fields") or [])
                  if (f.get("label") or "").lower() == "username" and f.get("value")), "")
-    # IDENTITY IS DECLARED, NOT DERIVED. The item states its name in `DNS Name`, and that is
-    # authoritative. Derivation stays only as the fallback for an item that has not declared one.
-    #
-    # Why it matters: derived identity MOVES when something else changes. A name taken from the
-    # endpoint follows the URL, so repointing a host at a different interface renamed it; a name
-    # taken from the title followed a rename of the credential. Neither edit is about identity,
-    # and both silently made the member look like a different member — including to the ip_drift
-    # and name_collision checks, which key off it.
-    #
-    # The declared name also unifies the two cases that used to need separate rules. A machine's
-    # DNS name is its identity, but a service's URL is the VENDOR's domain and names nothing
-    # useful — portal.azure.com would be "portal", login.tailscale.com "login". The vault answers
-    # both the same way, because every item declares a short canonical name (365-01, nas-01).
+    # IDENTITY IS DECLARED, NOT DERIVED — `DNS Name` is authoritative; derivation is fallback only.
+    # deliberate — see NOTES.md#declared-vs-derived-name
     is_service = any(t.lower() == "service" for t in (full.get("tags") or []))
     declared = _field(full, "dns name").lower()
-    # ⚠ This used to end `.removeprefix("wblv-")`, which was the last fact about THIS lab left in
-    # the code — a naming convention ("credential titles are prefixed wblv-") that the tool would
-    # have carried into any estate it was pointed at. Removed 2026-08-06.
-    #
-    # Nothing depends on it: `DNS Name` is authoritative and every item declares one, so this
-    # feeds only the fallback. Removing it also improves how the fallback FAILS. Before, an item
-    # with no declared name was silently corrected into something that happened to match the
-    # IPAM; now it derives the title as written, finds no IPAM entry, and says so. A member that
-    # cannot be identified should be visibly unidentified, not quietly guessed into place.
+    # ⚠ deliberate — the last lab-specific fact removed from this file, see NOTES.md#wblv-prefix-removed
     from_title = title.split("/")[0].strip().lower()
     derived = from_title if (is_service or not endpoint) else endpoint.split(".")[0].lower()
     # Tolerated rather than required: someone may reasonably write the FQDN here. The short name
     # is the identity either way, so both spellings resolve to the same member.
     name = declared.split(".")[0] if declared else derived
-    # A declared name that disagrees with the endpoint means one of the two fields is stale, and
-    # there is no way to tell WHICH from inside the tool — so it is reported, not resolved.
-    #
-    # Services are exempt BY DESIGN, not overlooked: their endpoint is the vendor's domain, so
-    # 365-01 vs portal.azure.com is the correct state of a healthy item. Faulting on it would
-    # light up every service permanently, and a fault that is always on is one nobody reads.
+    # Reported, not resolved — no way to tell which field is stale. Services exempt BY DESIGN.
     name_mismatch = bool(declared and endpoint and not is_service
                          and declared.split(".")[0] != endpoint.split(".")[0].lower())
-    # 1Password's Login item offers custom fields and labelled website entries, and Harry uses
-    # both — the M365 tenant_id and client_id live as LABELLED URLS because that is the slot the
-    # UI made easy. Reading only `fields` threw those labels away and made the data look like a
-    # malformed endpoint. Both are read; `fields` wins a clash, being the more deliberate slot.
-    #
-    # Labels are typed by hand in a GUI, so they are matched forgivingly: stored under both the
-    # plain lowercase form and one with spaces and hyphens folded to underscores, so "Client ID",
-    # "client-id" and "client_id" all resolve. A label that silently fails to match would look
-    # exactly like a field that was never filled in.
+    # deliberate — labels matched forgivingly across fields AND labelled URLs, see NOTES.md#field-label-matching
     def _keys(label):
         low = (label or "").strip().lower()
         return {low, re.sub(r"[\s\-]+", "_", low)} - {""}
 
-    # A set value never loses to an empty one. 1Password's built-in username/password sit in
-    # the fields array whether or not they are used, so an unfilled built-in would otherwise
-    # clobber a custom field of the same name purely on array order — which is luck, not design.
+    # deliberate — set value never loses to empty, see NOTES.md#set-value-wins-empty
     c = {}
     def put(label, value):
         for k in _keys(label):
@@ -483,10 +342,7 @@ def _member(item):
         put(u.get("label"), u.get("href") or "")
     for f in (full.get("fields") or []):
         put(f.get("label"), f.get("value") or "")
-    # Keyed by the ITEM's id, never by the resolved name. Two items can resolve to the same
-    # name — a duplicate made while migrating a format, say — and a name-keyed store lets one
-    # silently overwrite the other, so a member is probed with a different member's credentials
-    # and the result still reads "ok". Decided by thread scheduling, and invisible.
+    # ⚠ deliberate — keyed by item id, not name, see NOTES.md#creds-keyed-by-id
     CREDS[item["id"]] = c
     return {"id": item["id"], "item": title, "endpoint": endpoint, "account": user, "name": name,
             "scheme": scheme, "url_port": url_port, "website": website,
@@ -541,8 +397,7 @@ if not opn:
     die("no member declares a platform that can serve the IPAM — cannot read the lab",
         hint=f"one vault item needs Platform set to one of: {', '.join(IPAM_PLATFORMS)}")
 
-# Every item's fields were already read when membership was resolved. Fetching this one
-# again cost a second `op item get` — about a second — for bytes we were already holding.
+# reuses the fields already read during membership — no second `op item get`
 _f = CREDS.get(opn["id"], {})
 K = (_f.get("api_key") or _f.get("key") or "").removeprefix("key=")
 S = (_f.get("api_secret") or _f.get("secret") or "").removeprefix("secret=")
@@ -555,12 +410,7 @@ inventory, arp, ROUTER_MACS = {}, {}, set()
 with ThreadPoolExecutor(max_workers=3) as ex:
     _dns = ex.submit(curl, f"{API}/dnsmasq/settings/get", "-u", f"{K}:{S}")
     _arp = ex.submit(curl, f"{API}/diagnostics/interface/get_arp", "-u", f"{K}:{S}")
-    # The router does not hold a DHCP reservation for itself -- it IS the DHCP server -- so its
-    # own interfaces carry no MAC in the IPAM and every one of them counted as an address "no
-    # vault item claims". Three of fourteen non-members were opn-01 talking to itself, and the
-    # count had been overstating since it existed because a bare number cannot be inspected.
-    # DERIVED, not declared: the router knows its own interfaces, so nothing goes in a vault
-    # item that would then have to be maintained by hand.
+    # deliberate — router's own interfaces derived, not vault-declared, see NOTES.md#router-macs-derived
     _ifs = ex.submit(curl, f"{API}/interfaces/overview/interfacesInfo", "-u", f"{K}:{S}")
 try:
     dj = json.loads(_dns.result()[1] or "{}")
@@ -576,17 +426,12 @@ except Exception:
         hint="OPNsense is the inventory authority; without it there is no lab directory")
 
 if not inventory:
-    # Empty is not "no reservations" — it is a read that failed without raising. Left alone it
-    # yields a full table with every address, MAC and zone blank, and every host flagged as
-    # type-drifted because the wire appears to say nothing. Confident and wrong is the one
-    # outcome this tool may not produce.
+    # deliberate — empty is a failed read, not "no reservations", see NOTES.md#empty-ipam-dies
     die(f"the IPAM at {opn['endpoint'] or '(no endpoint)'} returned no host entries",
         hint="the OPNsense member has no usable endpoint, or its API credential was rejected")
 
 try:
-    # Keyed by MAC, not by the reserved IP. A host that is live on a different address than
-    # its reservation would silently fall out of an IP-keyed lookup, and the missing vendor
-    # would read as "aged out of ARP" — a data drift disguised as a stale cache entry.
+    # keyed by MAC, not reserved IP — a live-but-drifted host must not fall out of the lookup
     for e in json.loads(_arp.result()[1] or "[]"):
         if e.get("mac"):
             arp[e["mac"].lower()] = e
@@ -605,11 +450,8 @@ except Exception:
     pass          # unclaimed interfaces inflate the count again -- visibly, not silently
 
 
-# Every REACH result is measured FROM HERE, and "rpi-01 / LAN / up" only means "a pinhole is
-# open" if you know the prober sits in ADM. That fact was living in a note; this reads it off
-# the same IPAM as everything else. The machine is asked what it calls itself rather than
-# being told — nothing here names a host — and it degrades to no zone if this machine has no
-# reservation or has aged out of ARP.
+# Every REACH result is measured FROM HERE — "up" only means "a pinhole is open" if you know
+# the prober's own zone. Asked, not told: nothing here names a host.
 PROBER = socket.gethostname().split(".")[0].lower()
 PROBER_ZONE = arp.get(inventory.get(PROBER, {}).get("mac", ""), {}).get("intf_description", "")
 
@@ -629,43 +471,20 @@ def classify(m):
     rather than quietly resolved — same idea as the IPAM reserved-vs-live drift check. Neither
     signal is discarded, because each catches what the other cannot."""
     inv = inventory.get(m["name"], {})
-    # Two attributes, deliberately separate. PLATFORM is the API dialect and selects the auth
-    # probe — it changes entirely if OPNsense becomes pfSense. ROLE is what the thing is for and
-    # survives that swap untouched. Collapsing them made "role" mean two things at once.
-    # While items are being migrated, a lone `role` is still accepted as the platform.
+    # PLATFORM is the API dialect (selects the auth probe) — ROLE is what it's for, survives a
+    # product swap. Kept deliberately separate. A lone `role` is still accepted mid-migration.
     _c = CREDS.get(m["id"], {})
     platform = (_c.get("platform") or _c.get("role") or "").strip().lower()
     role = (_c.get("role") if _c.get("platform") else "").strip().lower()
-    # The item states how it is reached, so the tool no longer infers it from a naming
-    # convention. This used to come from a prefix table that named the MANAGEMENT port —
-    # necessary while items carried a bare browser URL, and wrong the moment one didn't. Every
-    # item now carries a real scheme, with an explicit port wherever it is not the default, so
-    # the table had nothing left to add and a rename can no longer change how a host is read.
+    # deliberate — replaced a management-port prefix table, see NOTES.md#scheme-from-item
     proto, port = (m.get("scheme") or ""), m.get("url_port")
     _a = arp.get(inv.get("mac", ""), {})
-    # Did the router see this member at all. EVERYTHING below that reads from the ARP entry —
-    # zone, vendor, live_ip, ip_drift and the type-drift check — is UNMEASURED when this is
-    # false, which is a different statement from "measured and clean". Kept as its own field
-    # because that distinction is invisible in the values themselves: a blank zone and an
-    # absent ARP entry render identically, and so did a skipped drift check.
+    # arp_seen: was this member measured at all — see NOTES.md#arp-seen
     arp_seen = bool(_a)
     vendor = _a.get("manufacturer", "")
     zone = _a.get("intf_description", "")      # LAN / ADM / PLY, straight off the interface
-    # The reservation says where it should be; ARP says where it is. Disagreement is the
-    # lease that outlived the misconfig which created it — silent until someone looks.
-    #
-    # ⚠ TRI-STATE, for exactly the reason REACH and AUTH are: with no ARP entry there is nothing
-    # to compare against, and a flat False asserted "checked, and no drift" about a host whose
-    # drift was never examined. That is the one claim this tool may not make.
-    #
-    # It is not a hypothetical. An ARP entry ages out on a QUIET host, and after a VLAN change
-    # the affected host is precisely the quiet one — so the check went silent exactly when it was
-    # load-bearing, and the lesson it exists to automate ("DHCP leases outlive the misconfig that
-    # created them") is the one it stopped enforcing. opn-01 is worse: it has no reservation of
-    # its own, so it has no MAC here and could never be checked at all, while reading clean.
-    #
-    # None = untested. The FAULT column treats it as falsy so a healthy table is unchanged, but
-    # --json can now tell "no drift" apart from "never looked".
+    # ⚠ deliberate — TRI-STATE, same reason REACH/AUTH are; "DHCP leases outlive the misconfig
+    # that created them" — see NOTES.md#ip-drift-tri-state
     ip_drift = (None if not (arp_seen and _a.get("ip") and inv.get("ip"))
                 else _a["ip"] != inv["ip"])
 
@@ -679,16 +498,9 @@ def classify(m):
     else:
         observed = ""                         # aged out of ARP — the wire cannot tell us
 
-    # ⚠ Same untested-vs-clean trap as ip_drift, and it shares the cause: with no ARP entry
-    # `observed` is "", so this reports no drift about a comparison that never happened. Left as
-    # a string rather than made tri-state — an empty drift string is already "nothing to say" —
-    # but `arp_seen` is what distinguishes the two, so a consumer can tell. Do not read a blank
-    # here as corroboration that the tag is right.
+    # ⚠ deliberate — same untested-vs-clean trap as ip_drift, see NOTES.md#type-drift-trap
     drift = (f"tagged {declared}, but the wire says {observed}"
              if declared and observed and declared != observed else "")
-    # A machine gets its URI rebuilt from the IPAM name, which is authoritative and may differ
-    # from whatever the vault item was typed with. A service has no IPAM entry, so its own URL
-    # is all there is — shown as written, path and all.
     declared_svc = any(t.lower() == "service" for t in m["tags"])
     return {**m, **inv, "role": role, "platform": platform, "port": port,
             "access": (m.get("website") or "") if (declared_svc and not inv) else
@@ -740,12 +552,7 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
             "-o", "ConnectTimeout=10", "-o", "PubkeyAuthentication=no",
             "-o", "NumberOfPasswordPrompts=1", "-o", "PreferredAuthentications=password"]
     if legacy:
-        # Appliances whose SSH predates current defaults. Modern OpenSSH refuses to negotiate
-        # with them at all, and it fails BEFORE the password prompt — so without this the probe
-        # reports "SSH refused before auth" for a device that is perfectly healthy, a false
-        # negative indistinguishable from a real fault. Asked for explicitly, per platform,
-        # rather than globally: weakening the client for every host to suit the worst one is
-        # how a workaround becomes the standard.
+        # deliberate — legacy appliances only, never globally, see NOTES.md#ssh-legacy-opts
         args += [x for o in SSH_LEGACY_OPTS for x in ("-o", o)] + [
                  "-o", "Ciphers=+aes128-cbc"]
     args += [f"{user}@{host}", cmd]
@@ -758,10 +565,7 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
         i = c.expect([expect_token, r"[Pp]ermission denied", r"[Aa]uthentication failed",
                       pexpect.EOF, pexpect.TIMEOUT])
         if i == 0:
-            # Drain the rest of the session so a capability check can ride the SAME login
-            # rather than opening a second one. "login ok" says the credential works; it says
-            # nothing about what it can then do, and on this estate those differ sharply —
-            # rpi-01's account authenticates perfectly and holds no sudo at all.
+            # Drain the session so a capability check rides the SAME login, not a second one.
             try:
                 c.expect([pexpect.EOF, pexpect.TIMEOUT], timeout=8)
             except Exception:
@@ -779,19 +583,11 @@ def ssh_probe(user, host, pw, expect_token, cmd, legacy=False):
         except Exception: pass
 
 def aruba_probe(user, host, pw, private_key=None):
-    """ArubaOS does not accept a command as an SSH argument — it opens an interactive session
-    with a banner and a keypress gate. Reaching the prompt IS the proof of login, so the probe
-    stops there rather than running anything.
-
-    The prompt character is the useful part: '>' is operator (show-only), '#' is manager. That
-    reports the PRIVILEGE LEVEL as observed on the device, which is the read-only guarantee
-    demonstrated rather than assumed — and it would catch the account being promoted.
-
-    A key is used when the item carries one, because the switch may be set
-    `aaa authentication ssh login public-key`, under which passwords are refused outright.
-    The two paths are kept separate rather than blended: WHICH mechanism succeeded is part of
-    what is being reported, and a client left free to fall back would report a key login that
-    never happened. The detail line says which was exercised."""
+    """ArubaOS takes no command as an SSH argument — it opens an interactive session behind a
+    keypress gate. Reaching the prompt IS the login proof; '>' is operator, '#' is manager,
+    which reports privilege level as observed, not assumed. Key and password paths are kept
+    separate (never blended) so which mechanism succeeded is part of what's reported.
+    See NOTES.md#aruba-probe-shape for the full rationale."""
     if pexpect is None:
         return None, "pexpect unavailable (run via uv, not bare python3)"
     if not private_key and not pw:
@@ -799,41 +595,19 @@ def aruba_probe(user, host, pw, private_key=None):
     base = ("-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=12 ")
     keyfile = None
     if private_key:
-        # ssh reads identities from a file, so the key cannot be handed over any other way.
-        # The exposure is bounded instead of avoided: 0600, private temp dir, one probe's
-        # lifetime, removed in the finally even when the probe raises.
+        # deliberate — bounded exposure: 0600, temp dir, this probe's lifetime only.
         fd, keyfile = tempfile.mkstemp(prefix="wblv-probe-", suffix=".key")
         os.write(fd, (private_key if private_key.endswith("\n") else private_key + "\n").encode())
         os.close(fd)
         os.chmod(keyfile, 0o600)
-        # A malformed key file and a rejected credential are INDISTINGUISHABLE from the far
-        # end: the switch answers "Permission denied" to both. ssh-keygen -y parses the file
-        # offline, so mangled key material is caught HERE as what it is, instead of being
-        # reported as a bad credential and sending someone to rotate a working secret.
-        # It also costs no authentication attempt, and this box has brute-force lockout.
-        #
-        # The fetch that mangles it is the ordinary-looking one. `op item get --fields <label>
-        # --reveal` renders a multi-line SSHKEY value wrapped in literal double quotes AND led
-        # by a newline; ssh rejects that file outright. Stripping the quotes alone leaves the
-        # leading blank line and it is STILL invalid -- which is why the obvious one-line repair
-        # reproduces the identical symptom. Read the whole item as JSON instead (as CREDS does).
-        #
-        # UNTESTED, not failed: nothing was ever sent, so the far end never said no. Reporting
-        # this as a failure would be the exact misread the null/false split exists to prevent.
+        # ⚠ deliberate — offline key-shape check before spending an auth attempt,
+        # see NOTES.md#aruba-key-quoting
         if subprocess.run(["ssh-keygen", "-y", "-f", keyfile], capture_output=True).returncode:
             os.unlink(keyfile)
             return None, ("private key material on the item is not a usable key file "
                           "(malformed); nothing was sent, so this is untested, not rejected")
-        # IdentitiesOnly and IdentityAgent=none force THIS key. With an agent in reach ssh can
-        # authenticate on a different identity and the probe would report success for a
-        # credential it never tested — the same reason the password path pins
-        # PubkeyAuthentication=no.
-        #
-        # PubkeyAcceptedAlgorithms=+ssh-rsa is asked for HERE, per platform, never globally.
-        # Mocana SSH 6.3 does not send the server-sig-algs extension, so a modern client cannot
-        # learn that SHA-2 RSA signatures are acceptable and silently declines to OFFER an RSA
-        # key at all ("no mutual signature algorithm"). The key is never SENT rather than
-        # rejected — which looks identical to a bad credential from the far end.
+        # deliberate — IdentitiesOnly/IdentityAgent=none pin THIS key; RSA sig-algs needed for
+        # Mocana SSH 6.3 — see NOTES.md#aruba-rsa-sig-algs
         opts = base + ("-o PasswordAuthentication=no -o PreferredAuthentications=publickey "
                        "-o IdentitiesOnly=yes -o IdentityAgent=none "
                        f"-o PubkeyAcceptedAlgorithms=+ssh-rsa -i {keyfile}")
@@ -873,19 +647,342 @@ def aruba_probe(user, host, pw, private_key=None):
 
 
 def _undecorate(v):
-    """Strip what a copy-paste adds to a credential but a credential never contains.
-
-    Surrounding whitespace, and ONE matching pair of wrapping quotes. Nothing else -- this
-    must not become a place where a wrong value is massaged into a plausible one. It exists
-    because the estate has now produced three credentials that were correct and unusable:
-    the OPNsense key=/secret= prefix, the aruba key rendered quoted and newline-led by
-    --fields, and a PVE token id stored as '" claude@pve!mac01"'. Every one of them failed
-    as a 401 or a Permission denied, which is the far end saying no to something it was
-    never sent properly."""
+    """Strip what a copy-paste adds to a credential but a credential never contains:
+    surrounding whitespace, and ONE matching pair of wrapping quotes. Nothing else — must
+    never massage a wrong value into a plausible one. See NOTES.md#undecorate-history for
+    the three real credentials this was built to catch."""
     v = (v or "").strip()
     if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
         v = v[1:-1].strip()
     return v
+
+
+def auth_probe_1password():
+    w = json.loads(op("whoami", "--format", "json") or "{}")
+    return (bool(w.get("user_uuid")),
+            f"service account on {w.get('url','?').split('//')[-1]}" if w.get("user_uuid")
+            else "op whoami returned nothing")
+
+
+def auth_probe_opnsense(c, host):
+    # deliberate — undecorate before stripping the key=/secret= prefix: a dirty paste wraps
+    # the WHOLE field (prefix included) in quotes, same failure family as the PVE token-id
+    # incident. See NOTES.md#undecorate-history.
+    k = _undecorate(c.get("api_key") or c.get("key") or "").removeprefix(OPN_PREFIXES["api_key"])
+    sec = _undecorate(c.get("api_secret") or c.get("secret") or "").removeprefix(OPN_PREFIXES["api_secret"])
+    got, body = curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}",
+                     "-w", "\n%{http_code}")
+    if not got:
+        return None, "no answer from the API"
+    body, _, code = body.rpartition("\n")
+    # deliberate — HTTP 401 is checked FIRST, not just the body's own status field: the body
+    # check alone fails OPEN on any rejection OPNsense ever answers in a shape other than
+    # {"status": 401, ...} — a differently-shaped error read as "authenticated, schema not
+    # recognised" instead of rejected. The protocol-level code is the reliable signal;
+    # see NOTES.md#opnsense-schema-move.
+    if code.strip() == "401":
+        return False, "API rejected the credential (401)"
+    j = json.loads(body or "{}")
+    if not j:
+        return None, "API answered with nothing parseable"
+    # deliberate — kept as a second check, not a fixed version-field path: assert on
+    # REJECTION, not on where the version string lives. See NOTES.md#opnsense-schema-move.
+    if j.get("status") == 401:
+        return False, "API rejected the credential"
+    v = (j.get("product") or {}).get("product_version") or j.get("product_version")
+    return True, f"OPNsense {v}" if v else "authenticated; firmware/status schema not recognised"
+
+
+def auth_probe_proxmox(r, c, host):
+    # Token id is not secret (USER@REALM!TOKENID); UUID is. Fixed Proxmox header form:
+    #   Authorization: PVEAPIToken=USER@REALM!TOKENID=UUID
+    tid = _undecorate(c.get("api_key") or c.get("username") or "")
+    uuid = _undecorate(c.get("api_secret") or c.get("password") or "")
+    if not (tid and uuid):
+        return None, "needs the token id (API Key) and its UUID (API Secret)"
+    # deliberate — SHAPE checked offline before spending an auth attempt. `=` is excluded
+    # too: a secret pasted into this field by mistake (token-id and UUID both contain no
+    # `=`, but `PVEAPIToken=id=secret` does) would otherwise pass this check and fail later
+    # with a generic rejection instead of the specific diagnostic below.
+    # See NOTES.md#undecorate-history
+    if not re.fullmatch(r"[^\s@!=]+@[^\s@!=]+![^\s@!=]+", tid):
+        return False, "token id is malformed — expected USER@REALM!TOKENID"
+    if not re.fullmatch(r"(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", uuid):
+        return False, "token secret is not a UUID — check the API Secret field"
+    hdr = ["-H", f"Authorization: PVEAPIToken={tid}={uuid}"]
+    port = r.get('port') or 8006
+    # deliberate — two calls separate "secret works" from "can read anything", fired
+    # concurrently rather than back to back since neither depends on the other's result;
+    # see NOTES.md#pve-two-call-auth
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_ver = ex.submit(curl, f"https://{host}:{port}/api2/json/version", *hdr)
+        f_nodes = ex.submit(curl, f"https://{host}:{port}/api2/json/nodes", *hdr)
+        got, body = f_ver.result()
+        got_n, body_n = f_nodes.result()
+    if not got:
+        return None, "no answer from the API"
+    try:
+        j = json.loads(body or "{}")
+    except ValueError:
+        return False, "API answered but not with JSON — check the token id form"
+    ver = (j.get("data") or {}).get("version")
+    if not ver:
+        return False, "API rejected the credential"
+    try:
+        nodes = (json.loads(body_n or "{}").get("data") or []) if got_n else None
+    except ValueError:
+        nodes = None
+    if nodes is None:
+        return True, f"PVE {ver} (node list unreadable — ACL not checked)"
+    if not nodes:
+        return False, f"PVE {ver}: token valid but reads nothing — no PVEAuditor ACL"
+    return True, f"PVE {ver}, {len(nodes)} node{'s' if len(nodes) != 1 else ''}"
+
+
+def auth_probe_synology(r, c, host):
+    u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
+    dsm = r.get("port") or 5001
+    base = f"https://{host}:{dsm}/webapi/entry.cgi"
+    # deliberate — manual note_op since this bypasses curl(); api= named, not query-lifted,
+    # see NOTES.md#dsm-note-op
+    note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.API.Auth (login)")
+    out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
+        "--data-urlencode", "api=SYNO.API.Auth",
+        "--data-urlencode", f"version={DSM_AUTH_VERSION}",
+        "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
+        "--data-urlencode", f"passwd={pw}",
+        "--data-urlencode", f"session={DSM_SESSION}",
+        "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
+    sid = (json.loads(out or "{}").get("data") or {}).get("sid")
+    if not sid:
+        return False, "DSM rejected the credential"
+    # ⚠ deliberate — ORDER IS LOAD-BEARING, capability read before logout,
+    # see NOTES.md#dsm-order-load-bearing
+    note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.Core.System")
+    info = subprocess.run(["curl", "-sk", "--max-time", "10", "-G", base,
+        "--data-urlencode", "api=SYNO.Core.System", "--data-urlencode", "version=1",
+        "--data-urlencode", "method=info", "--data-urlencode", f"_sid={sid}"],
+        capture_output=True, text=True).stdout
+    try:
+        ok = bool(json.loads(info or "{}").get("success"))
+    except ValueError:
+        ok = False
+    # Released only now, once nothing else needs the session. Repeated DSM logins churn
+    # sessions and can trip the auto-block, so every run must hand its own back.
+    note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.API.Auth (logout)")
+    subprocess.run(["curl", "-sk", "--max-time", "8", "-G", base,
+        "--data-urlencode", "api=SYNO.API.Auth",
+        "--data-urlencode", f"version={DSM_AUTH_VERSION}",
+        "--data-urlencode", "method=logout",
+        "--data-urlencode", f"session={DSM_SESSION}",
+        "--data-urlencode", f"_sid={sid}"], capture_output=True)
+    # named after the one API actually tried — not generalised to "Core APIs refused"
+    return True, ("DSM login ok, Core.System readable" if ok
+                  else "DSM login ok, Core.System REFUSED (105)")
+
+
+def _ssh_login_creds(r, c):
+    # shared by aruba-switch/linux/tplink-eap — proves the session is established, not merely
+    # connected — see NOTES.md#echo-proves-session
+    u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
+    pw = (c.get("password") or c.get("confirmpassword")
+          or c.get("operator password", "")).removeprefix("password=")
+    return u, pw
+
+
+def auth_probe_aruba_switch(r, c, host):
+    u, pw = _ssh_login_creds(r, c)
+    if not u:
+        return None, "no username field on the 1Password item"
+    return aruba_probe(u, host, pw, c.get("private_key") or "")
+
+
+def auth_probe_linux(r, c, host):
+    u, pw = _ssh_login_creds(r, c)
+    if not u:
+        return None, "no username field on the 1Password item"
+    cmd = "echo wblv-ok; sudo -n true 2>/dev/null && echo SUDO || echo NOSUDO"
+    return ssh_probe(u, host, pw, r"wblv-ok", cmd, legacy=False)
+
+
+def auth_probe_tplink_eap(r, c, host):
+    # TP-Link EAP: unprivileged BusyBox shell, legacy host keys only, no sudo to ask.
+    u, pw = _ssh_login_creds(r, c)
+    if not u:
+        return None, "no username field on the 1Password item"
+    return ssh_probe(u, host, pw, r"wblv-ok", "echo wblv-ok", legacy=True)
+
+
+def auth_probe_microsoft_graph(c):
+    # client-credentials against the tenant — a token issued proves app+secret+tenant live
+    tid, cid = c.get("tenant_id", ""), c.get("client_id", "")
+    sec = c.get("client_secret", "")
+    if not (tid and cid and sec):
+        return None, "needs tenant_id, client_id and client_secret fields on the item"
+    got, body = curl(f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token",
+                     "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
+                     "-d", "scope=https://graph.microsoft.com/.default",
+                     "-d", "grant_type=client_credentials")
+    if not got:
+        return None, "no answer from the token endpoint"
+    j = json.loads(body or "{}")
+    if j.get("access_token"):
+        # deliberate — decode roles claim so read-only-doctrine compliance is visible,
+        # see NOTES.md#graph-roles-claim
+        try:
+            _pl = j["access_token"].split(".")[1]
+            _pl += "=" * (-len(_pl) % 4)
+            _roles = json.loads(base64.urlsafe_b64decode(_pl)).get("roles") or []
+            _w = [x for x in _roles if ".ReadWrite." in x or x.endswith(".Write")]
+            if _roles:
+                return True, (f"Graph token, {len(_roles)} roles, "
+                              + (f"{len(_w)} WRITE" if _w else "all read"))
+        except Exception:
+            pass          # a token that will not decode is still a token that issued
+        return True, "Graph token issued"
+    # not-a-token is not automatically a rejection — see NOTES.md#transient-oauth
+    if (j.get("error") or "") in TRANSIENT_OAUTH:
+        return None, f"token endpoint unavailable ({j['error']})"
+    return False, (j.get("error_description", "").split(".")[0][:70]
+                   or "token endpoint rejected the credential")
+
+
+def auth_probe_tailscale(c):
+    # "-" alias — own tailnet, no name written down. Prefer scoped OAuth over a raw
+    # full-access API key; say so in the detail when the blunt instrument is in use.
+    cid, sec = c.get("client_id", ""), c.get("client_secret", "")
+    k, how = c.get("api_key", "") or c.get("password", ""), "API key (full-access)"
+    if cid and sec:
+        got, body = curl("https://api.tailscale.com/api/v2/oauth/token",
+                         "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
+                         "-d", "grant_type=client_credentials")
+        if not got:
+            return None, "no answer from the OAuth endpoint"
+        tok = json.loads(body or "{}")
+        k, how = tok.get("access_token", ""), "OAuth client"
+        if not k:
+            if (tok.get("error") or "") in TRANSIENT_OAUTH:
+                return None, f"OAuth endpoint unavailable ({tok['error']})"
+            return False, "OAuth client rejected"
+        auth = ["-H", f"Authorization: Bearer {k}"]
+    elif k:
+        auth = ["-u", f"{k}:"]
+    else:
+        return None, "needs client_id + client_secret (scoped OAuth) or api_key"
+    got, body = curl("https://api.tailscale.com/api/v2/tailnet/-/devices", *auth)
+    if not got:
+        return None, "no answer from the API"
+    j = json.loads(body or "{}")
+    devs = j.get("devices")
+    if devs is None:
+        return False, (j.get("message", "")[:60] or "API rejected the credential")
+    return True, f"{len(devs)} devices, via {how}"
+
+
+def auth_probe_jira(r, c):
+    # Basic auth email:token — the only scheme that survives SSO; deliberate,
+    # see NOTES.md#jira-basic-auth-survives-sso
+    user, k = c.get("username") or "", c.get("api_key") or c.get("password") or ""
+    # Website, not DNS Name — the API host, vs the service's canonical short name.
+    host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
+    if not (user and k and host):
+        return None, "item needs username, API Key and a Website URL"
+    # credentials via STDIN/--config, never argv — see NOTES.md#creds-never-in-argv
+    got, body = curl(f"https://{host}/rest/api/3/myself",
+                     "-H", "Accept: application/json", "--config", "-",
+                     stdin=f'user = "{user}:{k}"\n')
+    if not got:
+        return None, "no answer from the API"
+    try:
+        j = json.loads(body or "{}")
+    except ValueError:
+        return None, "unreadable answer from the API"
+    who = j.get("displayName") or j.get("emailAddress") or ""
+    if not who:
+        return False, "API rejected the token"
+    # deliberate — enumerate authority, not a single word; best-effort/non-fatal,
+    # see NOTES.md#jira-permission-enumeration
+    grant = ""
+    try:
+        ok2, b2 = curl(f"https://{host}/rest/api/3/mypermissions"
+                       "?permissions=BROWSE_PROJECTS,CREATE_ISSUES,EDIT_ISSUES,"
+                       "DELETE_ISSUES,ADMINISTER",
+                       "-H", "Accept: application/json", "--config", "-",
+                       stdin=f'user = "{user}:{k}"\n')
+        if ok2:
+            P = (json.loads(b2 or "{}") or {}).get("permissions", {})
+            def has(x): return bool(P.get(x, {}).get("havePermission"))
+            held = [n for n, key in (("admin", "ADMINISTER"), ("create", "CREATE_ISSUES"),
+                                     ("edit", "EDIT_ISSUES"), ("delete", "DELETE_ISSUES"))
+                    if has(key)]
+            if held:
+                grant = ", " + "+".join(held)
+            elif has("BROWSE_PROJECTS"):
+                grant = ", read-only"      # the goal; say so when it is true
+    except Exception:
+        grant = ""      # untested authority is not the same as no authority
+    return True, f"{who}{grant}"
+
+
+def auth_probe_github(r, c):
+    # PAT as bearer token, /user is the cheapest live READ. deliberate — vault first,
+    # then gh's own store, source REPORTED not silently resolved,
+    # see NOTES.md#github-vault-then-gh
+    k, src = (c.get("api_key") or c.get("password") or ""), "vault"
+    if not k:
+        # bounded like every probe — an unbounded gh keychain prompt hangs the whole pool
+        try:
+            note_op("gh auth token")
+            k, src = subprocess.run(["gh", "auth", "token"], capture_output=True,
+                                    text=True, timeout=10).stdout.strip(), "gh"
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            k, src = "", "gh"
+        if k:
+            CRED_FALLBACK.add(r["id"])
+    if not k:
+        return None, "no api_key on the item, and gh holds no token"
+    # ⚠ deliberate — headers to stderr/body to stdout (not `-D -`, which interleaves
+    # unreliably); token via STDIN never argv — see NOTES.md#github-header-body-split
+    note_op("GET api.github.com/user")
+    r_ = subprocess.run(["curl", "-s", "-D", "/dev/stderr", "--max-time", "10",
+                         "--config", "-",
+                         "-H", "Accept: application/vnd.github+json",
+                         "https://api.github.com/user"],
+                        input=f'header = "Authorization: Bearer {k}"\n',
+                        capture_output=True, text=True, timeout=15)
+    if r_.returncode != 0:
+        return None, "no answer from the API"
+    head = r_.stderr
+    login = (json.loads(r_.stdout or "{}") or {}).get("login")
+    if not login:
+        return False, "API rejected the token"
+    # deliberate — PRESENT-but-empty header vs ABSENT header are different PAT kinds,
+    # see NOTES.md#github-scopes-header
+    scoped = next((l.split(":", 1)[1].strip() for l in head.splitlines()
+                   if l.lower().startswith("x-oauth-scopes:")), None)
+    grants = [s.strip() for s in (scoped or "").split(",") if s.strip()]
+    admin = [s for s in grants if s.startswith("admin:")]
+    kind = (f"{len(grants)} scopes" + (f" incl. {len(admin)} admin" if admin else "")
+            if grants else "classic, no scopes" if scoped is not None
+            else "fine-grained")
+    return True, f"{login}, {kind}, via {src}"
+
+
+# deliberate — one function per vendor dialect, dispatched by table: see NOTES.md for why the
+# interpretation layer can't be generic (OPNsense vs Proxmox vs DSM all mean "authenticated"
+# differently) even though the mechanics (curl/ssh_probe) already are.
+AUTH_PROBES = {
+    "opnsense": lambda r, c, host: auth_probe_opnsense(c, host),
+    "proxmox": auth_probe_proxmox,
+    "synology": auth_probe_synology,
+    "aruba-switch": auth_probe_aruba_switch,
+    "linux": auth_probe_linux,
+    "tplink-eap": auth_probe_tplink_eap,
+    "microsoft-graph": lambda r, c, host: auth_probe_microsoft_graph(c),
+    "tailscale": lambda r, c, host: auth_probe_tailscale(c),
+    "jira": lambda r, c, host: auth_probe_jira(r, c),
+    "github": lambda r, c, host: auth_probe_github(r, c),
+}
 
 
 def auth_probe(r):
@@ -894,390 +991,18 @@ def auth_probe(r):
     c, host = CREDS.get(r["id"], {}), r.get("fqdn") or r["endpoint"]
     try:
         if r["platform"] == "1password":
-            # Deliberately ahead of the host check: this probe talks to no host. It already ran
-            # as the substrate pre-check before any member was resolved, so it costs nothing to
-            # report, and requiring a URL purely to satisfy the plumbing would be ceremony —
-            # my.1password.com being reachable proves nothing about this account.
-            w = json.loads(op("whoami", "--format", "json") or "{}")
-            return (bool(w.get("user_uuid")),
-                    f"service account on {w.get('url','?').split('//')[-1]}" if w.get("user_uuid")
-                    else "op whoami returned nothing")
+            # ahead of the host check on purpose — this probe talks to no host
+            return auth_probe_1password()
         if not host:
             return None, "no endpoint to test"
-        if r["platform"] == "opnsense":
-            k = (c.get("api_key") or c.get("key") or "").removeprefix(OPN_PREFIXES["api_key"])
-            sec = (c.get("api_secret") or c.get("secret") or "").removeprefix(OPN_PREFIXES["api_secret"])
-            got, body = curl(f"https://{host}/api/core/firmware/status", "-u", f"{k}:{sec}")
-            if not got:
-                return None, "no answer from the API"
-            j = json.loads(body or "{}")
-            if not j:
-                return None, "API answered with nothing parseable"
-            # Assert on the REJECTION, not on a version string at one fixed path. OPNsense
-            # says 401 / "Authentication Failed" in the body when it refuses; that is the
-            # only thing that means the credential is bad. Inferring failure from a missing
-            # field made a SCHEMA MOVE indistinguishable from a rejected login: 26.7 nested
-            # product_version inside "product", so a 200 carrying a valid payload rendered
-            # as "auth fail" three times across three sessions and sent us looking at a
-            # credential that was never involved. Read both paths; a version we cannot name
-            # is a gap in this tool's knowledge, not a gap in the login.
-            if j.get("status") == 401:
-                return False, "API rejected the credential"
-            v = (j.get("product") or {}).get("product_version") or j.get("product_version")
-            return True, f"OPNsense {v}" if v else "authenticated; firmware/status schema not recognised"
-        if r["platform"] == "proxmox":
-            # PVE API token. The token id is not itself secret (it is USER@REALM!TOKENID);
-            # the UUID is. Header form is fixed by Proxmox:
-            #   Authorization: PVEAPIToken=USER@REALM!TOKENID=UUID
-            tid = _undecorate(c.get("api_key") or c.get("username") or "")
-            uuid = _undecorate(c.get("api_secret") or c.get("password") or "")
-            if not (tid and uuid):
-                return None, "needs the token id (API Key) and its UUID (API Secret)"
-            # Check the SHAPE offline, before spending an auth attempt. A token id is
-            # USER@REALM!TOKENID and nothing else; a UUID is 8-4-4-4-12 hex. The first real
-            # one stored here arrived as '" claude@pve!mac01"' -- a leading space and a pair
-            # of wrapping quotes carried in with the paste -- and PVE answered 401, which is
-            # indistinguishable from a revoked token. Same family as the key=/secret= prefix
-            # and the quoted aruba key: the credential was correct and the FETCH was dirty.
-            # _undecorate strips the decoration; this says so when something is left that
-            # cannot be a token, rather than blaming the far end for refusing it.
-            if not re.fullmatch(r"[^\s@!]+@[^\s@!]+![^\s@!]+", tid):
-                return False, "token id is malformed — expected USER@REALM!TOKENID"
-            if not re.fullmatch(r"(?i)[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}", uuid):
-                return False, "token secret is not a UUID — check the API Secret field"
-            hdr = ["-H", f"Authorization: PVEAPIToken={tid}={uuid}"]
-            got, body = curl(f"https://{host}:{r.get('port') or 8006}/api2/json/version", *hdr)
-            if not got:
-                return None, "no answer from the API"
-            try:
-                j = json.loads(body or "{}")
-            except ValueError:
-                return False, "API answered but not with JSON — check the token id form"
-            ver = (j.get("data") or {}).get("version")
-            if not ver:
-                return False, "API rejected the credential"
-            # /version needs only a valid token, so a 200 here proves the SECRET and nothing
-            # about the ACL. A privsep token with no `pveum acl modify` is the likeliest way
-            # to get this wrong, and it fails exactly like Jira's search endpoint: authorised,
-            # permission-filtered, and empty -- which reads as a healthy but idle cluster.
-            # /nodes needs Sys.Audit on /nodes, which is what PVEAuditor actually grants, so
-            # the two calls together separate "the secret works" from "it can read anything".
-            got_n, body_n = curl(f"https://{host}:{r.get('port') or 8006}/api2/json/nodes", *hdr)
-            try:
-                nodes = (json.loads(body_n or "{}").get("data") or []) if got_n else None
-            except ValueError:
-                nodes = None
-            if nodes is None:
-                return True, f"PVE {ver} (node list unreadable — ACL not checked)"
-            if not nodes:
-                return False, f"PVE {ver}: token valid but reads nothing — no PVEAuditor ACL"
-            return True, f"PVE {ver}, {len(nodes)} node{'s' if len(nodes) != 1 else ''}"
-        if r["platform"] == "synology":
-            u = c.get("username", ""); pw = c.get("password") or c.get("confirmpassword", "")
-            # The port comes from the member, not from a literal. It was written here AND in
-            # the prefix table, so the two could disagree with nothing to catch it.
-            dsm = r.get("port") or 5001
-            base = f"https://{host}:{dsm}/webapi/entry.cgi"
-            # Recorded here because this probe drives curl directly rather than through
-            # curl(), for the logout it has to issue. A call that skips the helper skips the
-            # recorder too, and the row would claim nothing was checked.
-            # Every DSM call goes to entry.cgi, so a note_op naming only the path collapses
-            # three operations into one -- note_op dedupes identical text by design. Name the
-            # API instead, or --check reports one call on a run that made three, in a tool
-            # whose stated contract is that probe_ops describes what HAPPENED.
-            # The api= label is constructed here, not lifted from the query string: the query
-            # string is where the password rides and must never reach the recorder.
-            note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.API.Auth (login)")
-            out = subprocess.run(["curl", "-sk", "--max-time", "15", "-G", base,
-                "--data-urlencode", "api=SYNO.API.Auth",
-                "--data-urlencode", f"version={DSM_AUTH_VERSION}",
-                "--data-urlencode", "method=login", "--data-urlencode", f"account={u}",
-                "--data-urlencode", f"passwd={pw}",
-                "--data-urlencode", f"session={DSM_SESSION}",
-                "--data-urlencode", "format=sid"], capture_output=True, text=True).stdout
-            sid = (json.loads(out or "{}").get("data") or {}).get("sid")
-            if not sid:
-                return False, "DSM rejected the credential"
-            # ⚠ ORDER IS LOAD-BEARING. The capability read must happen while the session is
-            # still valid. Written the other way round — logout first — a dead session returns
-            # an error that looks exactly like a permissions refusal, and the probe would have
-            # reported "insufficient permission" about a session it had just closed itself.
-            # Right answer, wrong reason, and nothing in the output would have said so.
-            #
-            # A bare "DSM login ok" reads as full access to the box holding the backups. One
-            # representative READ turns that into a measurement. 105 is "insufficient
-            # permission", which is a different answer from the API not existing.
-            note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.Core.System")
-            info = subprocess.run(["curl", "-sk", "--max-time", "10", "-G", base,
-                "--data-urlencode", "api=SYNO.Core.System", "--data-urlencode", "version=1",
-                "--data-urlencode", "method=info", "--data-urlencode", f"_sid={sid}"],
-                capture_output=True, text=True).stdout
-            try:
-                ok = bool(json.loads(info or "{}").get("success"))
-            except ValueError:
-                ok = False
-            # Released only now, once nothing else needs the session. Repeated DSM logins churn
-            # sessions and can trip the auto-block, so every run must hand its own back.
-            note_op(f"GET {host}:{dsm}/webapi/entry.cgi api=SYNO.API.Auth (logout)")
-            subprocess.run(["curl", "-sk", "--max-time", "8", "-G", base,
-                "--data-urlencode", "api=SYNO.API.Auth",
-                "--data-urlencode", f"version={DSM_AUTH_VERSION}",
-                "--data-urlencode", "method=logout",
-                "--data-urlencode", f"session={DSM_SESSION}",
-                "--data-urlencode", f"_sid={sid}"], capture_output=True)
-            # Name the API that was actually tried. "Core APIs refused" generalises from ONE
-            # sample to a class — true here, as it happens, but the probe does not prove it,
-            # and a label that claims more than it measured is the defect this tool exists to
-            # catch. Widening the sample would mean more DSM logins, which trips its auto-block.
-            return True, ("DSM login ok, Core.System readable" if ok
-                          else "DSM login ok, Core.System REFUSED (105)")
-        if r["platform"] in ("aruba-switch", "linux", "tplink-eap"):
-            u = c.get("username", "").removeprefix("username=") or r.get("account") or ""
-            pw = (c.get("password") or c.get("confirmpassword")
-                  or c.get("operator password", "")).removeprefix("password=")
-            if not u:
-                return None, "no username field on the 1Password item"
-            # Prove the session is really established, not merely connected: the switch echoes
-            # its own name, the shell echoes a token we chose.
-            if r["platform"] == "aruba-switch":
-                # An SSH-key item carries no password at all, so the key is not an override of
-                # the password — it is the only credential the item has. Both are passed and
-                # the probe picks: a Login item still probes by password unchanged, which is
-                # what lets the two item formats coexist during a migration.
-                return aruba_probe(u, host, pw, c.get("private_key") or "")
-            # A standalone TP-Link EAP answers SSH with an unprivileged BusyBox ash shell
-            # (uid 1, cannot even write /dev/null), not the restricted CLI its GUI implies, so
-            # the same echo test proves the session for real. Its host keys are ssh-rsa/ssh-dss
-            # only, hence legacy.
-            # linux answers a sudo question for free on the session it is already opening.
-            # The EAP's BusyBox has no `id` and no sudo, and cannot even write /dev/null, so
-            # asking would produce noise rather than an answer -- it stays unmeasured, and says
-            # so, rather than being reported as unprivileged on an assumption.
-            cmd = ("echo wblv-ok; sudo -n true 2>/dev/null && echo SUDO || echo NOSUDO"
-                   if r["platform"] == "linux" else "echo wblv-ok")
-            return ssh_probe(u, host, pw, r"wblv-ok", cmd,
-                             legacy=r["platform"] == "tplink-eap")
-        if r["platform"] == "microsoft-graph":
-            # Client-credentials against the tenant. A token issued is proof the app
-            # registration, the secret and the tenant are all live — which is what "is M365
-            # reachable" actually means. TLS to a Microsoft endpoint only proves Microsoft is up.
-            tid, cid = c.get("tenant_id", ""), c.get("client_id", "")
-            sec = c.get("client_secret", "")
-            if not (tid and cid and sec):
-                return None, "needs tenant_id, client_id and client_secret fields on the item"
-            got, body = curl(f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token",
-                             "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
-                             "-d", "scope=https://graph.microsoft.com/.default",
-                             "-d", "grant_type=client_credentials")
-            if not got:
-                return None, "no answer from the token endpoint"
-            j = json.loads(body or "{}")
-            if j.get("access_token"):
-                # The token carries its own grants in the `roles` claim, so what this
-                # credential can DO costs nothing extra to report — it is already in hand.
-                # "Graph token issued" only ever said the secret was live. Whether those
-                # grants are read-only is the fact the estate's read-only doctrine turns on,
-                # and it was invisible.
-                try:
-                    _pl = j["access_token"].split(".")[1]
-                    _pl += "=" * (-len(_pl) % 4)
-                    _roles = json.loads(base64.urlsafe_b64decode(_pl)).get("roles") or []
-                    _w = [x for x in _roles if ".ReadWrite." in x or x.endswith(".Write")]
-                    if _roles:
-                        return True, (f"Graph token, {len(_roles)} roles, "
-                                      + (f"{len(_w)} WRITE" if _w else "all read"))
-                except Exception:
-                    pass          # a token that will not decode is still a token that issued
-                return True, "Graph token issued"
-            # An answer that is not a token is not automatically a rejection. OAuth names its
-            # server-side transients, and reading one as "your credential is bad" sends Harry
-            # to rotate a working secret during someone else's outage — the same mistake as
-            # deriving reach from a transport failure, one layer up.
-            if (j.get("error") or "") in TRANSIENT_OAUTH:
-                return None, f"token endpoint unavailable ({j['error']})"
-            return False, (j.get("error_description", "").split(".")[0][:70]
-                           or "token endpoint rejected the credential")
-        if r["platform"] == "tailscale":
-            # The API key's own tailnet, via the "-" alias, so no tailnet name is written down.
-            # Tailscale API keys authenticate as basic auth with an empty password.
-            # An OAuth client can be scoped (devices:read); a raw API key cannot — it is
-            # full-access and could delete or re-authorise nodes. Prefer the scoped one, and
-            # say so in the detail when the blunt instrument is in use.
-            cid, sec = c.get("client_id", ""), c.get("client_secret", "")
-            k, how = c.get("api_key", "") or c.get("password", ""), "API key (full-access)"
-            if cid and sec:
-                got, body = curl("https://api.tailscale.com/api/v2/oauth/token",
-                                 "-d", f"client_id={cid}", "-d", f"client_secret={sec}",
-                                 "-d", "grant_type=client_credentials")
-                if not got:
-                    return None, "no answer from the OAuth endpoint"
-                tok = json.loads(body or "{}")
-                k, how = tok.get("access_token", ""), "OAuth client"
-                if not k:
-                    if (tok.get("error") or "") in TRANSIENT_OAUTH:
-                        return None, f"OAuth endpoint unavailable ({tok['error']})"
-                    return False, "OAuth client rejected"
-                auth = ["-H", f"Authorization: Bearer {k}"]
-            elif k:
-                auth = ["-u", f"{k}:"]
-            else:
-                return None, "needs client_id + client_secret (scoped OAuth) or api_key"
-            got, body = curl("https://api.tailscale.com/api/v2/tailnet/-/devices", *auth)
-            if not got:
-                return None, "no answer from the API"
-            j = json.loads(body or "{}")
-            devs = j.get("devices")
-            if devs is None:
-                return False, (j.get("message", "")[:60] or "API rejected the credential")
-            return True, f"{len(devs)} devices, via {how}"
-        if r["platform"] == "jira":
-            # Basic auth with email:token — Atlassian's documented REST scheme, and the ONLY
-            # one that survives SSO. An account federated to Entra cannot present its IdP
-            # credentials to the API at all, which is precisely why the token exists and why
-            # mac-01 can reach Jira with no browser and no human in front of it. It also means
-            # a Conditional Access misfire that locks the browser out does NOT lock this out —
-            # worth knowing, not worth relying on.
-            #
-            # /myself is the cheapest READ that proves a token is live: it mutates nothing and
-            # returns the identity the token is acting as.
-            user, k = c.get("username") or "", c.get("api_key") or c.get("password") or ""
-            # Website, not DNS Name — see the reach branch. DNS Name is the canonical short
-            # name for a service; the API host is the Website URL.
-            host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
-            if not (user and k and host):
-                return None, "item needs username, API Key and a Website URL"
-            # Credentials go in on STDIN via --config, never in argv: an argument is readable
-            # by any local process from `ps` and lands verbatim in any spindump swept into a
-            # diagnostic bundle. Same invariant ssh_probe and the github branch state.
-            got, body = curl(f"https://{host}/rest/api/3/myself",
-                             "-H", "Accept: application/json", "--config", "-",
-                             stdin=f'user = "{user}:{k}"\n')
-            if not got:
-                return None, "no answer from the API"
-            try:
-                j = json.loads(body or "{}")
-            except ValueError:
-                return None, "unreadable answer from the API"
-            who = j.get("displayName") or j.get("emailAddress") or ""
-            if not who:
-                return False, "API rejected the token"
-            # Report the AUTHORITY the credential carries, not merely that it works — the same
-            # reason the github branch reads x-oauth-scopes. On the Free plan every account
-            # with product access is an admin, so a read-only credential is not achievable and
-            # this WILL read "admin". That is the point: the accepted gap stays visible every
-            # session instead of living only in the register. If it ever stops saying admin,
-            # something real changed.
-            #
-            # Best-effort and deliberately non-fatal: a working token whose permission lookup
-            # failed is still a working token, and must not be downgraded to a red AUTH.
-            # Enumerate what the credential can DO, not a single word for it. Reporting
-            # "ADMIN" collapsed a set into a label and overstated it: this token holds
-            # ADMINISTER and EDIT and CREATE but NOT DELETE, so "ADMIN" read as "can do
-            # anything" while a delete was refused. A credential description that is wider
-            # than the credential is the same defect as one that is narrower.
-            #
-            # Best-effort and deliberately non-fatal: a working token whose permission lookup
-            # failed is still a working token and must not be downgraded to a red AUTH.
-            grant = ""
-            try:
-                ok2, b2 = curl(f"https://{host}/rest/api/3/mypermissions"
-                               "?permissions=BROWSE_PROJECTS,CREATE_ISSUES,EDIT_ISSUES,"
-                               "DELETE_ISSUES,ADMINISTER",
-                               "-H", "Accept: application/json", "--config", "-",
-                               stdin=f'user = "{user}:{k}"\n')
-                if ok2:
-                    P = (json.loads(b2 or "{}") or {}).get("permissions", {})
-                    def has(x): return bool(P.get(x, {}).get("havePermission"))
-                    held = [n for n, key in (("admin", "ADMINISTER"), ("create", "CREATE_ISSUES"),
-                                             ("edit", "EDIT_ISSUES"), ("delete", "DELETE_ISSUES"))
-                            if has(key)]
-                    if held:
-                        grant = ", " + "+".join(held)
-                    elif has("BROWSE_PROJECTS"):
-                        grant = ", read-only"      # the goal; say so when it is true
-            except Exception:
-                grant = ""      # untested authority is not the same as no authority
-            return True, f"{who}{grant}"
-        if r["platform"] == "github":
-            # A PAT authenticates as a bearer token, and /user is the cheapest READ that proves
-            # one is live: it mutates nothing and costs one of 5,000 hourly calls. The item's
-            # Website stays the human URL, as it does for the tenant and the tailnet — the API
-            # host is the probe's business, not something to make Harry type.
-            # The vault first, then gh's own store. `gh` already holds a working token and is
-            # the tool that owns it, so copying it into 1Password would create a second copy
-            # that goes stale the moment gh re-authenticates — the same reason ops-01 carries
-            # no secret and is probed via the local op token. Which source was used is REPORTED
-            # rather than silently resolved: a probe that quietly falls back to a local
-            # credential would show green while the vault entry it claims to test is wrong.
-            k, src = (c.get("api_key") or c.get("password") or ""), "vault"
-            if not k:
-                # Bounded like every other probe. Unbounded, a gh that blocks on a Keychain
-                # prompt with no human present never returns, and because probe() runs in a
-                # thread pool the WHOLE directory hangs — the session hook dies at 60s with no
-                # lab state, the MCP server at 120s. One row's credential is not worth that.
-                try:
-                    note_op("gh auth token")
-                    k, src = subprocess.run(["gh", "auth", "token"], capture_output=True,
-                                            text=True, timeout=10).stdout.strip(), "gh"
-                except (subprocess.TimeoutExpired, FileNotFoundError):
-                    k, src = "", "gh"
-                if k:
-                    CRED_FALLBACK.add(r["id"])
-            if not k:
-                return None, "no api_key on the item, and gh holds no token"
-            # Headers as well as body. GitHub returns the token's own grants in x-oauth-scopes,
-            # so the probe can report the AUTHORITY it is carrying rather than merely that it
-            # works — a credential wider than its job is a finding, and this surfaces it every
-            # session instead of during an incident. Fine-grained PATs send no such header,
-            # which is itself the answer.
-            #
-            # Headers go to stderr and the body to stdout, so the two are separated by the OS
-            # rather than by parsing. `-D -` interleaves them on one stream with no reliable
-            # blank line between: curl emits CRLF per header but no CRLFCRLF terminator, so
-            # splitting on it silently yields an empty body and reads as a rejected token.
-            #
-            # The token goes in on STDIN, never in argv. ssh_probe's docstring already states
-            # the invariant — a secret passed as an argument is readable by any local process
-            # from `ps`, and lands verbatim in any sample or spindump swept into a diagnostic
-            # bundle. The KEEP whitelist guards the output path; argv was leaking out the side.
-            note_op("GET api.github.com/user")
-            r_ = subprocess.run(["curl", "-s", "-D", "/dev/stderr", "--max-time", "10",
-                                 "--config", "-",
-                                 "-H", "Accept: application/vnd.github+json",
-                                 "https://api.github.com/user"],
-                                input=f'header = "Authorization: Bearer {k}"\n',
-                                capture_output=True, text=True, timeout=15)
-            if r_.returncode != 0:
-                return None, "no answer from the API"
-            head = r_.stderr
-            login = (json.loads(r_.stdout or "{}") or {}).get("login")
-            if not login:
-                return False, "API rejected the token"
-            # A header that is PRESENT but empty is a classic PAT with no scopes ticked, which
-            # is not the same thing as an absent header (a fine-grained PAT). Collapsing them
-            # reported a legacy full-account token as the modern narrowly-scoped kind — the
-            # exact inversion this branch exists to prevent. Split on the comma and strip,
-            # since the separator is ", " only by convention.
-            scoped = next((l.split(":", 1)[1].strip() for l in head.splitlines()
-                           if l.lower().startswith("x-oauth-scopes:")), None)
-            grants = [s.strip() for s in (scoped or "").split(",") if s.strip()]
-            admin = [s for s in grants if s.startswith("admin:")]
-            kind = (f"{len(grants)} scopes" + (f" incl. {len(admin)} admin" if admin else "")
-                    if grants else "classic, no scopes" if scoped is not None
-                    else "fine-grained")
-            return True, f"{login}, {kind}, via {src}"
-        return None, ""
+        fn = AUTH_PROBES.get(r["platform"])
+        return fn(r, c, host) if fn else (None, "")
     except Exception as e:
         return None, f"probe error: {type(e).__name__}"
 
 def reach_probe(host, port):
-    """The two tests are raced, not tried in turn. Either one answering is proof of life, so
-    waiting for the first to time out before starting the second simply adds one timeout to
-    the other — and that only ever happens on a host that is down, which is precisely the host
-    that sets the wall-clock for the whole run.
-
-    The timeouts themselves are deliberately NOT reduced. They are what stops a slow-but-alive
-    host being reported as down, and a false 'down' is the failure this tool exists to avoid."""
+    """Raced, not tried in turn — either test answering is proof of life. Timeouts are
+    deliberately NOT reduced, see NOTES.md#reach-probe-timeouts"""
     # Recorded like every other operation, so CHECK accounts for REACH as well as AUTH. Both
     # are noted because both are attempted: they are raced, and either answering is the result.
     if port:
@@ -1307,10 +1032,7 @@ def tenant_reach(r):
         tid = c.get("tenant_id", "")
         if not tid:
             return None, ""
-        # Entra publishes per-tenant OIDC discovery with no credential. A live tenant answers
-        # 200 and echoes its own id in `issuer`; one that does not exist answers 400
-        # AADSTS90002. The id is CHECKED, not merely the status — a 200 describing somebody
-        # else's tenant would be a pass proving nothing about ours.
+        # Entra OIDC discovery, no credential — issuer id CHECKED, not just the status.
         got, body = curl(f"https://login.microsoftonline.com/{tid}"
                          "/v2.0/.well-known/openid-configuration")
         if not got:
@@ -1318,52 +1040,33 @@ def tenant_reach(r):
         try:
             j = json.loads(body or "{}")
         except ValueError:
-            # A captive portal, a proxy error page or an HTML 5xx is an answer we cannot read,
-            # which is not a verdict. Unguarded this raised inside a thread pool and took the
-            # WHOLE directory down with a traceback — every healthy host with it.
+            # ⚠ deliberate — unreadable answer is not a verdict, see NOTES.md#unguarded-json-crash
             return None, ""
         iss = j.get("issuer") or ""
         if iss:
             return (tid.lower() in iss.lower()), "tenant"
-        # ONLY the specific tenant-not-found answer counts as absent. Anything else Entra says
-        # — throttling, temporarily_unavailable, an interstitial — must stay None, because a
-        # False here also suppresses the auth probe, and that is the signal actually trusted.
-        # Reporting a live tenant as gone while silently skipping the login is the worst of
-        # both: it looks like a deleted tenant and proves nothing.
+        # deliberate — ONLY the specific not-found answer counts as absent,
+        # see NOTES.md#tenant-absence-specificity
         err = f"{j.get('error') or ''} {j.get('error_description') or ''}".lower()
         if "invalid_tenant" in err or "aadsts90002" in err:
             return False, "tenant"
         return None, ""
     if r["platform"] == "jira":
-        # Atlassian Cloud publishes serverInfo with no credential, and it ECHOES the site's own
-        # baseUrl. Same shape as the Entra discovery document and the GitHub account probe: it
-        # needs no secret, it names OUR tenant rather than the vendor, and it discriminates.
-        # That keeps this row off "derived", so REACH stops depending on the token being valid.
-        #
-        # ⚠ That this endpoint answers at all is itself a standard #15 declared-exposure
-        # finding — "reachable without authenticating" is exactly what #15 asks to be
-        # enumerated and justified. It is Atlassian's default rather than a misconfiguration,
-        # and it is recorded in the jsm-01 runbook rather than silently relied upon here.
-        # ⚠ NOT dns_name. For a service, "DNS Name" carries the SHORT CANONICAL NAME
-        # (jsm-01, 365-01, git-01) — the vault's answer to "what is this called" — while the
-        # API host lives in the item's Website URL. Reading dns_name here builds
-        # https://jsm-01/... and fails in a way that looks like an unreachable tenant.
+        # Atlassian serverInfo, no credential, echoes the site's own baseUrl.
+        # ⚠ deliberate — this endpoint's unauthenticated reachability is a recorded, justified
+        # exposure (standard #15), see NOTES.md#jira-serverinfo-exposure
+        # ⚠ Website, NOT dns_name — see NOTES.md#jira-website-not-dns-name
         host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0].strip()
         if not host:
             return None, ""
-        # The status code is requested explicitly because an HTTP error is a COMPLETED
-        # transfer: curl exits 0 on a 404, so REACHED alone cannot separate "this site does
-        # not exist" from "the answer was unreadable". Atlassian's 404 is an HTML page, not
-        # JSON, so without the code both collapse into a ValueError and a live-but-renamed
-        # site would report as untested forever.
+        # deliberate — status code requested explicitly, curl exits 0 on a 404,
+        # see NOTES.md#http-code-vs-reached
         got, body = curl(f"https://{host}/rest/api/3/serverInfo", "-w", "\n%{http_code}")
         if not got:
             return None, ""        # never reached it: says nothing about the tenant
         body, _, code = body.rpartition("\n")
         if code.strip() == "404":
-            # ONLY the specific site-not-found answer counts as absent. Throttling, a captive
-            # portal or a 5xx must stay None — a False here also suppresses the auth probe,
-            # and reporting a live site as gone while skipping the login proves nothing.
+            # deliberate — see NOTES.md#tenant-absence-specificity
             return False, "tenant"
         try:
             j = json.loads(body or "{}")
@@ -1376,11 +1079,7 @@ def tenant_reach(r):
             return (host.lower() in base), "tenant"
         return None, ""
     if r["platform"] == "github":
-        # GitHub publishes an account unauthenticated, and the account IS the tenant here.
-        # Same shape as the Entra discovery document: it needs no credential, it names the
-        # thing we care about rather than the vendor, and it discriminates — a real account
-        # answers 200 echoing its own login, one that does not exist answers 404. That takes
-        # this row off "derived", so REACH stops depending on the PAT being valid.
+        # unauthenticated account lookup — the account IS the tenant here
         who = c.get("username", "")
         if not who:
             return None, ""
@@ -1401,26 +1100,15 @@ def tenant_reach(r):
 
 
 def describe_check(r):
-    """What this row's probe actually did, read back from what it recorded.
-
-    Nothing recorded means nothing ran, and the honest answer is "-" — the same dash REACH
-    and AUTH use for untested, meaning the same thing. It is not a claim that no probe could
-    exist; it is the absence of one, which is what you want to see for a platform whose probe
-    has not been written yet.
-
-    The table gets the PRIMARY operation and a count of everything else; --json gets the lot
-    under `probe_ops`. Primary means the one that produced AUTH, falling back to the reach
-    test when no login was attempted — so a member whose platform has no probe written still
-    says what was tried rather than going blank. The full M365 form carries a tenant GUID twice and runs
-    past 150 characters, which is why the detail belongs where there is no width to spend."""
+    """What this row's probe actually did, read back from what it recorded. Nothing recorded
+    means nothing ran — "-", same dash REACH/AUTH use for untested. Table gets the PRIMARY
+    operation + a count; --json gets the lot under `probe_ops`. See NOTES.md#describe-check-primary"""
     ops = PROBE_OPS.get(r["id"]) or []
     if not ops:
         return ""                      # nothing ran at all; "-" is the honest answer
     auth_ops = [o for o in ops if not o.startswith(("tcp ", "ping "))]
     primary = (auth_ops or ops)[0]
-    # A URL collapses to its host: the path is the least surprising part and the longest.
-    # Anything else — ssh, op, gh — is already the answer, minus the remote command, which is
-    # how the login is proven rather than what was contacted.
+    # a URL collapses to its host; anything else is already the answer minus the remote command
     shown = (primary.split()[1].split("/")[0] if primary.startswith(("GET ", "POST "))
              else primary.split(" -- ")[0])
     return shown + (f" ({len(ops)})" if len(ops) > 1 else "")
@@ -1441,14 +1129,7 @@ def probe(r):
     host = r.get("fqdn") or r["endpoint"]
     port = r.get("port")
     hostless = r["platform"] in HOSTLESS_ROLES
-    # A DECLARED service only. classify() also INFERS "service" from the wire, for any member
-    # with no IPAM entry — and an untagged host that has fallen out of Dnsmasq, or whose item
-    # hostname stopped matching its reservation, looks exactly like that. Routing it here
-    # would drop the reach gate and fire repeated password logins at a box that never
-    # answered, which is the DSM auto-block the synology branch warns about. The tag is Harry
-    # stating what a thing is; the wire is a guess, and a guess must never change how a member
-    # is measured. Hostless members take this path whatever they are tagged, because there is
-    # no address to measure either way.
+    # ⚠ deliberate — DECLARED service only, never the wire's guess, see NOTES.md#declared-service-only
     service = hostless or (r["type"] == "service" and r["source"] == "tag")
 
     if not host and not service:
@@ -1458,26 +1139,12 @@ def probe(r):
 
     if service:
         reach, basis = tenant_reach(r)
-        # A tenant proven absent is not a login to attempt — the same restraint that stops a
-        # dead host being probed, and the reason auth stays "-" rather than "fail".
+        # a tenant proven absent is not a login to attempt
         ok, detail = auth_probe(r) if reach is not False else (None, "")
-        # A completed auth attempt IS a reach test: you cannot be rejected by something you
-        # did not reach. But that only holds for a verdict the far end actually gave us —
-        # which is why every probe now returns None, not False, when the transfer never
-        # completed. Deriving from False was reporting a total outage as REACH up.
+        # deliberate — a completed auth attempt IS a reach test, see NOTES.md#auth-attempt-is-reach
         if reach is None and ok is not None:
             reach, basis = True, "derived"
-        # Still nothing, and NOTHING WAS ATTEMPTED: fall back to the endpoint so a member
-        # onboarded the way the design intends — vault item first, probe later — reports a
-        # measured heartbeat rather than a row of dashes indistinguishable from a broken
-        # vault entry.
-        #
-        # The `not detail` is load-bearing, not a tidy-up. Every probe that RAN and failed to
-        # reach says so ("no answer from the API"); only the fallthrough for a platform with
-        # no probe written returns None with nothing to say. Falling back on the noisy case
-        # too would put the vendor's front door back into REACH by the side door — an outage
-        # would show the tenant as up because portal.azure.com still accepts TCP, which is
-        # the exact green-light-wired-to-the-wrong-thing this rework existed to remove.
+        # ⚠ deliberate — `not detail` is load-bearing, not a tidy-up, see NOTES.md#not-detail-load-bearing
         if reach is None and host and ok is None and not detail:
             reach, basis = reach_probe(host, port), "endpoint"
     else:
@@ -1485,11 +1152,8 @@ def probe(r):
         basis = "endpoint" if host else "untested"
         ok, detail = auth_probe(r) if reach else (None, "")
 
-    # The ACCESS column is the one thing this tool exists to hand you, and once services
-    # stopped being measured by their own URL nothing checked it at all: a mistyped vendor
-    # hostname is still syntactically valid, so `url` never fires, and the row went fully
-    # green while the URI in it was dead. Checked separately and reported as a FAULT, so it
-    # cannot leak back into REACH and start meaning "the vendor is up" again.
+    # ⚠ deliberate — ACCESS checked separately, reported as FAULT not REACH,
+    # see NOTES.md#access-unreachable-fault
     access_bad = bool(service and host and reach is True and basis != "endpoint"
                       and not reach_probe(host, port))
 
@@ -1499,11 +1163,9 @@ def probe(r):
             "check": describe_check(r), "probe_ops": list(PROBE_OPS.get(r["id"]) or [])}
 
 
-# Filtering here rather than at print time: a filtered view has no reason to probe hosts it
-# will not show, and `-s` was paying for five host probes to print one service row.
+# filtered here, not at print time — `-s` was paying for five host probes to print one service row
 _all = [classify(m) for m in members]
-# Two vault items resolving to one name is a data fault: whichever the eye lands on, the other
-# is a member you are not seeing. Surfaced on both rows rather than silently de-duplicated.
+# deliberate — collision surfaced on both rows, not silently de-duplicated, see NOTES.md#name-collision
 _seen = {}
 for _r in _all:
     _seen.setdefault(_r["name"], []).append(_r)
@@ -1511,14 +1173,9 @@ for _n, _rs in _seen.items():
     if len(_rs) > 1:
         for _r in _rs:
             _r["name_collision"] = len(_rs)
-# How much of the wire the directory accounts for. A property of the DIRECTORY, not of any
-# host, which is why it is counted here and not attached to a row. Counted before the filter,
-# because a filtered view does not make the rest of the lab stop existing.
+# counted before the filter, a property of the directory, not of any one host
 _member_macs = {r["mac"] for r in _all if r.get("mac")}
-# A COUNT cannot tell you a device appeared. "14 things on your wire that no vault item
-# claims" answers "how much of the wire is accounted for" but not "what is alive", which is
-# the question this tool exists for — so keep the detail, not just the tally. It is also what
-# a since-last-session diff needs: you cannot diff a number into "this is new".
+# deliberate — full detail kept, not just a tally, see NOTES.md#off-members-detail
 OFF_MEMBERS = sorted(
     ({"ip": e.get("ip", ""), "mac": mac,
       "zone": e.get("intf_description") or e.get("intf") or "",
@@ -1534,27 +1191,13 @@ with ThreadPoolExecutor(max_workers=6) as ex:      # independent and I/O-bound; 
 rows.sort(key=lambda r: (r["type"] == "service", r["name"]))
 
 # ---------------------------------------------------------------- Jira task snapshot -----
-# jsm-01 is a member like any other, and its task state is member DETAIL in the same way
-# auth_detail is: a fact about that member, read live, stored nowhere. The default view shows
-# only the counts, because "is the lab healthy" and "what should I do next" are different
-# questions and the second one is asked with --tasks.
-#
-# ⚠ Returns None for UNTESTED and never a zeroed dict. A Jira outage that reported "0 open"
-# would read as "all work is done", which is the worst possible lie this tool could tell.
-# ⚠ The project key and the custom-field IDs are facts about THIS lab and THIS Jira site.
-# They were hardcoded here, which is the precise thing the comment ~900 lines above records
-# as having been deliberately removed ("the last fact about THIS lab left in the code").
-# Both are now DISCOVERED: the key from the site, the field ids by NAME. A customfield_10042
-# is meaningless on any other tenant and would silently read as empty rather than failing.
+# jsm-01 is a member like any other; its task state is member DETAIL, read live, stored nowhere.
+# ⚠ deliberate — None for UNTESTED, never a zeroed dict; project key/field ids DISCOVERED,
+# never hardcoded, see NOTES.md#jira-snapshot-design
 JIRA_FIELDS = ("Lab ID", "Hands", "Last verified")
-# Page size asked for, and how many pages before the count becomes an admitted floor. The
-# server trims by response size and hands back fewer than asked with a token, so the real
-# bound is PAGES, not maxResults — 8 x 100 is ~4x the current board and still a fixed stop.
+# deliberate — real bound is PAGES not maxResults, see NOTES.md#jira-page-bound
 JIRA_PAGE, JIRA_MAX_PAGES = 100, 8
-# Why a False came back. "The far end refused" and "you have two projects and have not said
-# which" are both False, but they send you to completely different places -- and a tool that
-# names the wrong cause is worse than one that says nothing.
-TASKS_WHY = []
+TASKS_WHY = []      # why a False came back — different causes need different fixes
 
 
 def esc(t):
@@ -1566,10 +1209,7 @@ def jira_snapshot(rows):
     """One call, everything computed here. Returns None if there is no jira member or the
     API did not answer; a dict otherwise. Blocked-ness is derived from real issue links, not
     from prose, which is the whole reason task state left markdown."""
-    # Deliberately given the UNFILTERED member list. Fed the -p/-v view's rows, jsm-01 simply
-    # is not there, and the tool then reports "jsm-01 did not answer" -- stating as measured
-    # fact that a probe failed when it was never sent. off_directory is computed before the
-    # filter for exactly this reason.
+    # deliberate — given the UNFILTERED member list, see NOTES.md#jira-snapshot-unfiltered
     m = next((r for r in rows if r["platform"] == "jira"), None)
     if not m:
         return None
@@ -1578,20 +1218,10 @@ def jira_snapshot(rows):
     host = re.sub(r"^[a-z]+://", "", (m.get("endpoint") or "")).split("/")[0].strip()
     if not (user and k and host):
         return None
-    # note_op attributes to _CUR.id, which probe() sets on its pool workers. This runs on the
-    # main thread after the pool has joined, so without this its calls record NOTHING and
-    # --check/probe_ops under-report what the run actually contacted — in a tool whose stated
-    # contract is that probe_ops describes what happened, not what the code intends to do.
+    # ⚠ deliberate — this thread must set _CUR.id itself, see NOTES.md#jira-snapshot-note-op
     _CUR.id = m["id"]
-    # maxResults is bounded: a runaway project must not turn a session hook into a paginator.
-    # If it is ever hit the count is a floor, and truncated says so rather than lying quietly.
-    # WORK is hierarchyLevel 0. Epics (1) are containers and sub-tasks (-1) would double-count
-    # their parent. Filtered by TYPE ID, not by name: "issuetype != Epic" silently starts
-    # counting epics as work the day somebody renames the type, and nothing would say so.
-    # Which project? Discovered, not named. One project on the site is unambiguous, so use it.
-    # More than one and the tool must be TOLD which -- guessing would silently report another
-    # project's backlog as the lab's. The vault is where a member declares things about itself,
-    # so a "Project" field on the item settles it.
+    # WORK = hierarchyLevel 0, filtered by TYPE ID not name. Project discovered, not named —
+    # see NOTES.md#jira-project-discovery
     got, body = curl(f"https://{host}/rest/api/3/project/search?maxResults=50",
                      "--config", "-", stdin=f'user = "{user}:{k}"\n')
     if not got:
@@ -1624,14 +1254,10 @@ def jira_snapshot(rows):
     except ValueError:
         return None
     if not work_ids:
-        # The transfer completed and the answer had no work types in it: that is the far end
-        # saying no (revoked token, renamed project), not a probe that never ran. curl()'s own
-        # contract is "no answer is None, never False" -- so this must be False.
+        # completed transfer, no work types = far end saying no — must be False, not None
         return False
     only = f"issuetype in ({', '.join(work_ids)})"
 
-    # Field IDs by name. Empty is not "no such field": it means the lookup failed, and the
-    # caller must not then render every task as having no Lab ID and no owner.
     got, body = curl(f"https://{host}/rest/api/3/field",
                      "--config", "-", stdin=f'user = "{user}:{k}"\n')
     if not got:
@@ -1642,24 +1268,13 @@ def jira_snapshot(rows):
         return None
     FID = {n: by_name.get(n) for n in JIRA_FIELDS}
     if not FID["Lab ID"]:
-        # Without it every task falls back to its Jira key, and the vault's 1a.5 references
-        # stop resolving. Better to say the field is missing than to renumber the estate.
+        # without it every task falls back to its Jira key and the vault's 1a.5 refs stop resolving
         TASKS_WHY.append("the Jira site has no custom field named 'Lab ID' — task ids would "
                          "fall back to Jira keys and the vault's references would stop resolving")
         return False
 
-    # Fetch OPEN work only. Done issues never leave a project, so a whole-project fetch is
-    # bounded by HISTORY rather than by outstanding work — it would have crossed any cap on
-    # completed tasks alone, and the counts would then have quietly meant "open among the
-    # first N". Open work is the thing that is actually bounded.
-    # maxResults is a CEILING the server may ignore: it trims pages by response size. Asking
-    # for 200 returned 100 and a nextPageToken, so len(first page) was reported as the open
-    # count and under-read 135 open items as 100 — a third of the board missing, with the
-    # number rendered as confidently as any other. The cap was never the bound that mattered.
-    # So page until the token runs out, still bounded: a session hook must not become an
-    # unbounded paginator, but one that stops at the first page is not a counter at all.
-    # A later page that fails is NOT a failed probe — the earlier pages were really measured.
-    # It degrades to the floor the cap always promised, and truncated says so.
+    # ⚠ deliberate — OPEN work only, paged until token exhausted, not by maxResults alone,
+    # see NOTES.md#jira-pagination-truncation
     issues, tok, cut = [], None, False
     for _ in range(JIRA_MAX_PAGES):
         args = ["-G", "--data-urlencode",
@@ -1689,13 +1304,18 @@ def jira_snapshot(rows):
             cut = True; break
         issues += page
         tok = j.get("nextPageToken")
+        # deliberate — isLast is a second, independent truncation signal: a degenerate but
+        # documented-possible response can carry isLast:false with no nextPageToken. Reading
+        # completeness off the token alone would then report a short page as the full set.
+        if j.get("isLast") is False and not tok:
+            cut = True
+            break
         if not tok:
             break
     else:
         cut = bool(tok)                  # pages exhausted with a token still outstanding
 
-    # Done is counted, never listed: the number is the only part anyone reads, and counting it
-    # costs one call instead of paging through every task ever finished.
+    # done counted, never listed — one call instead of paging through every finished task
     dgot, dbody = curl(f"https://{host}/rest/api/3/search/approximate-count",
                        "-X", "POST", "-H", "Content-Type: application/json",
                        "-d", json.dumps({"jql": f"project = {key} AND {only}"
@@ -1707,11 +1327,7 @@ def jira_snapshot(rows):
         done_n = None                    # untested, and it says so rather than showing 0
 
     out = {"open": 0, "prog": 0, "done": done_n, "ready": [], "blocked": [], "mine": [],
-           # Set only where the paging loop actually stopped early — page budget spent with a
-           # token outstanding, or a later page that failed. Absence of a token is the ONLY
-           # evidence of a complete set: the endpoint trims by response size, so a short page
-           # proves nothing, and reading completeness off len() is what hid 35 open items.
-           "truncated": cut,
+           "truncated": cut,      # see NOTES.md#jira-pagination-truncation
            "host": host}
     for i in issues:
         f = i["fields"]
@@ -1719,20 +1335,12 @@ def jira_snapshot(rows):
         labid = f.get(FID["Lab ID"]) or i["key"]
         hands = (f.get(FID["Hands"]) or {}).get("value") or "-"
         out["prog" if cat == "indeterminate" else "open"] += 1
-        # "is blocked by" pointing at something not yet done. A link to a CLOSED blocker is
-        # not a blocker, which is the difference between a dependency graph and a list of
-        # references — and the reason this is computed rather than stored.
-        # An issue carries inwardIssue for the end it IS BLOCKED BY, and outwardIssue for the
-        # end it blocks. type["inward"] is the same string on BOTH directions, so testing it
-        # alone keeps every Blocks link; the side that is present is what carries the direction.
-        # Read the wrong side and the graph inverts -- and it inverts into something plausible,
-        # which is why it survived a review of the rendered output. Verified against raw links.
+        # ⚠ deliberate — inwardIssue is the BLOCKER side, verified against raw links,
+        # see NOTES.md#jira-link-direction
         waits = [l["inwardIssue"] for l in (f.get("issuelinks") or [])
                  if l["type"]["inward"] == "is blocked by" and l.get("inwardIssue")
                  and l["inwardIssue"]["fields"]["status"]["statusCategory"]["key"] != "done"]
-        # Jira text is user-supplied and goes through a markup renderer: a summary containing
-        # "[ADM]" would be swallowed as an unknown style and "[/]" raises. A rendered value that
-        # differs from the measured value breaks the rule that every glyph maps to a measurement.
+        # esc() — Jira text is user-supplied and Rich treats [...] as markup
         row = {"id": esc(labid), "key": i["key"], "hands": hands,
                "scope": esc(((f.get("parent") or {}).get("fields") or {}).get("summary", "").split(" —")[0]),
                "phase": ((f.get("fixVersions") or [{}])[0] or {}).get("name", "")[:2],
@@ -1744,8 +1352,7 @@ def jira_snapshot(rows):
             out["ready"].append(row)
             if hands == "Claude":
                 out["mine"].append(row)
-    # Blocked rows name Jira keys; the vault speaks Lab IDs. Translate, because a runbook that
-    # says "1e.1" and a hook that says "LAB-6" do not obviously refer to the same thing.
+    # translate Jira keys to Lab IDs — a runbook says "1e.1", not "LAB-6"
     key2id = {i["key"]: (i["fields"].get(FID["Lab ID"]) or i["key"]) for i in issues}
     for r in out["blocked"]:
         r["waits"] = [key2id.get(k, k) for k in r["waits"]]
@@ -1753,37 +1360,26 @@ def jira_snapshot(rows):
 
 
 def op_value(OP, label):
-    """The fetch for a field that a 1Password LOGIN item duplicates.
+    """The fetch for a field that a 1Password LOGIN item duplicates — built-in username/password
+    are EMPTY on this estate, real values live in ACCESS. Selects on HAVING A VALUE, not
+    position. See NOTES.md#op-value-empty-builtin-fields
 
-    Every login item carries built-in `username` and `password` fields, and on this estate
-    they are EMPTY on all of them — the real values live in the item's ACCESS section as
-    `Username` / `Password`. `--fields label=password` matches case-insensitively and returns
-    the FIRST match, so it hands back the empty built-in and the recipe fails at the far end:
-    DSM answers 400, ssh prompts. Both look exactly like a wrong password, which sends you to
-    rotate a credential that was never broken.
-
-    Select on HAVING A VALUE rather than on position. The duplicate is the item's shape, not
-    one bad entry — nas-01, rpi-01 and wap-01 all carry it — so the recipe must survive it
-    whether or not the vault is ever tidied. Same reason aruba-switch reads --format json:
-    --fields is the fetch that looks ordinary and quietly returns the wrong thing."""
+    deliberate — matches every raw label that ALIASES folds to this canonical one (e.g. a
+    field literally labelled "Passwd" for "password"), not just the canonical spelling. The
+    Python-side credential lookup (put(), near CREDS) already folds aliases; this printed
+    recipe was the one place that didn't, so a field named by its alias showed green in the
+    tool but the generated recipe fetched nothing."""
+    labels = sorted({label} | {k for k, v in ALIASES.items() if v == label})
+    want = " or ".join(f'(.label|ascii_downcase)=="{l}"' for l in labels)
     return (f'{OP} --format json --reveal '
-            f"""| jq -r '[.fields[] | select((.label|ascii_downcase)=="{label}") """
+            f"""| jq -r '[.fields[] | select({want}) """
             f"""| .value | select(. != null and . != "")][0] // empty'""")
 
 
 def howto(r):
-    """The exact call that authenticates to this member, assembled from the same constants
-    the probe uses and the same live member data everything else here reads.
-
-    NOT prose. "Strip the key= prefix" is an instruction to be interpreted and misread; a
-    literal invocation is a value. Every one of these was got wrong by hand at least once,
-    and in each case the correct answer was already sitting in auth_probe where nothing could
-    read it — this tool's own description is "here's how you get in", and that half of it
-    lived only in code.
-
-    A line marked UNVERIFIED is inferred from the probe rather than run end to end. Saying so
-    is the point: an unrun command presented as a working one is the same defect as an
-    unmeasured value presented as a measurement."""
+    """The exact call that authenticates to this member — assembled from the same constants
+    and live data auth_probe uses. NOT prose: a literal invocation is a value, an instruction
+    to interpret is not. UNVERIFIED marks anything inferred rather than run end to end."""
     host = re.sub(r"^[a-z]+://", "", (r.get("endpoint") or "")).split("/")[0]
     item, acct, pf = r["item"], r.get("account") or "", r["platform"]
     OP = f'op item get "{item}" --vault {VAULT}'
@@ -1814,9 +1410,7 @@ def howto(r):
                 f'# session MUST be {DSM_SESSION} — any other name is refused 402. Log out after.',
                 '# NEVER in parallel: concurrent logins race DSM and trip its auto-block.']
     elif pf == "aruba-switch":
-        # KEY ONLY, and the key is the whole difficulty. --format json, never --fields: see
-        # the note in aruba_probe -- --fields renders a multi-line SSHKEY value quoted and
-        # newline-led, ssh rejects the FILE, and the switch reports it as "Permission denied".
+        # --format json, never --fields — see NOTES.md#aruba-key-quoting
         out += ['K=$(mktemp -t wblv-swt); chmod 600 "$K"; trap \'rm -f "$K"\' EXIT',
                 f'{OP} --format json --reveal \\',
                 '  | jq -r \'.fields[] | select((.label|ascii_downcase)=="private key") | .value\' > "$K"',
@@ -1876,19 +1470,13 @@ def faults_of(r):
                              ("name", r.get("name_mismatch")),
                              ("access", r.get("access_unreachable")),
                              ("cred", r.get("cred_fallback")),
-                             # A recorded expiry is only worth a column once it is near -- or
-                             # already past, which reads as negative days and must still fault
-                             # rather than going quiet.
+                             # negative days (already expired) must still fault, not go quiet
                              ("expiry", r.get("cred_expiry") is not None
                               and r["cred_expiry"] <= EXPIRY_WARN_DAYS),
                              ("dup", r.get("name_collision"))) if bad]
 
 
-# Lazy and guarded. Lazy because --json carries no task fields, so paying three serialized
-# round-trips for data the output cannot hold is pure latency on a hook with a 60s budget and a
-# member count about to grow. Guarded because every other probe is wrapped per member: unwrapped,
-# one unexpected Jira payload takes the WHOLE directory down with a traceback, and reach/auth for
-# every host disappears because of a ticket link.
+# lazy (no task fields in --json) and guarded (one bad Jira payload must not take the whole run down)
 _TASKS_CACHE = []
 
 
@@ -1902,14 +1490,9 @@ def tasks_snapshot():
 
 
 def render(rows, meta):
-    """A table for humans. Colour encodes STATE and nothing else — green up, red down, dim
-    untested. Every glyph maps to a measured value; none of it is commentary.
-
-    The counts go ABOVE the table because they are the answer to "is the lab healthy"; the
-    table is the detail you read only when a count is wrong.
-
-    rich drops colour automatically when stdout is not a terminal, so a pipe or the session
-    hook gets clean text and only a human at a prompt sees the colour."""
+    """A table for humans. Colour encodes STATE only — green up, red down, dim untested; every
+    glyph maps to a measured value, none of it is commentary. Counts sit ABOVE the table since
+    they answer "is the lab healthy"; the table is the detail you read when a count is wrong."""
     from rich.console import Console
     from rich.table import Table
     from rich.measure import Measurement
@@ -1924,11 +1507,7 @@ def render(rows, meta):
         v = f"[{style}]{value}[/]" if style else str(value)
         con.print(f"[dim]{label + ':':<15}[/]{v}")
 
-    # Time leads because everything under it is a measurement, and a measurement without a
-    # timestamp is a claim (#14). It is also the answer to "what is now" for anything reading
-    # this output — a session hook that has to guess the date will fabricate one, and a
-    # fabricated timestamp is indistinguishable from a measured one once written down.
-    # UTC first because the estate standard is UTC; local in brackets because Harry is not.
+    # deliberate — Time leads, everything below it is a measurement (#14), see NOTES.md#time-leads
     _utc = time.gmtime(); _loc = time.localtime()
     field("Time", time.strftime("%Y-%m-%d %H:%M:%S UTC", _utc)
                   + f"  [dim](local {time.strftime('%H:%M %Z', _loc)})[/]")
@@ -1956,14 +1535,10 @@ def render(rows, meta):
     _faulted = sum(1 for r in rows if faults_of(r))
     field("Faults", _faulted, "red" if _faulted else "")
     field("Non-members", meta["off_directory"])
-    # UNTESTED prints a dash, exactly as REACH and AUTH do, and means the same thing. A Jira
-    # outage must never render as "0 open" — that reads as "all work is done".
+    # UNTESTED prints a dash, same as REACH/AUTH — a Jira outage must never render as "0 open"
     TASKS = tasks_snapshot()
-    # probe() copies check/probe_ops out of PROBE_OPS when its worker finishes, and the task
-    # calls happen later on this thread — so the row still describes the run as it was BEFORE
-    # them. Re-read it, or --check reports five operations on a run that made eight. This is a
-    # symptom of the task snapshot living outside the probe pool; the structural fix is to make
-    # it part of jsm-01's own probe.
+    # deliberate — re-read check/probe_ops, task calls happen after the pool joins,
+    # see NOTES.md#jira-probe-ops-reread
     for _r in rows:
         if _r.get("platform") == "jira":
             _r["probe_ops"] = list(PROBE_OPS.get(_r["id"]) or [])
@@ -1989,12 +1564,7 @@ def render(rows, meta):
             if want and r["name"] != want:
                 continue
             con.print(f"\n[bold]{r['name']}[/]  [dim]{r['platform']}  {r.get('access') or '-'}[/]")
-            # soft_wrap: these are commands to be PASTED, not prose to be laid out. With a
-            # non-tty console the width is COLUMNS (the hook sets 150), and rich was wrapping
-            # the longest recipe mid-argument — `--vault \n Lab-Claude` — so the one line most
-            # likely to be copied verbatim was the one line that could not be. A wrapped recipe
-            # fails as a shell error attributable to the host, sending the reader to debug a
-            # login that was never actually attempted.
+            # deliberate — soft_wrap, commands are PASTED not laid out, see NOTES.md#howto-soft-wrap
             for l in howto(r):
                 con.print("  " + ("[dim]" + l + "[/]" if l.lstrip().startswith("#") else l),
                           soft_wrap=True)
@@ -2028,18 +1598,15 @@ def render(rows, meta):
         return
 
     if SHOW_BRIEF:
-        # Named explicitly rather than scraped from a column: the hook hands this list to the
-        # to-do generator so it does not make its own probe, and a consumer that has to parse
-        # a rendered table breaks the moment the table changes shape.
+        # named explicitly, not scraped from a rendered column — a hook consumer must not parse a table
         field("Members", " ".join(r["name"] for r in rows))
         bad = [r for r in rows
                if r["reach"] is not True or r["auth"] is not True or faults_of(r)]
         if not bad:
             if SHOW_HOWTO: _howto_block()
-            return          # Faults/Reachable/Authenticated above already state it, measured
+            return          # already stated above, measured
         con.print()
-        # Only what is not normal, with why. One line each: the full row is one command away
-        # and the point here is that the exception is impossible to miss.
+        # one line per exception, impossible to miss
         con.print(f"[bold]NOT NORMAL — {len(bad)} of {len(rows)}[/]")
         for r in bad:
             state = ("[red]down[/]" if r["reach"] is False else
@@ -2064,11 +1631,7 @@ def render(rows, meta):
             return
         DASH = "[grey35]-[/]"
         if TASK_ID:
-            # One record reads as fields, not as a one-row table — the same shape the header
-            # uses, for the same reason: there is nothing to compare it against.
-            # Accepts the Jira key too: this same view prints `Jira: LAB-6`, and WAITS ON can
-            # print a raw key whenever the blocker sits outside the fetched open set. Rejecting
-            # the identifier the tool just showed you is its own small betrayal.
+            # one record as fields, not a one-row table; accepts the Jira key too (WAITS ON can print one)
             hit = [r for r in TASKS["ready"] + TASKS["blocked"]
                    if TASK_ID.lower() in (r["id"].lower(), r["key"].lower())]
             if not hit:
@@ -2084,9 +1647,7 @@ def render(rows, meta):
                 field("Waits on", ", ".join(r["waits"]) if r["waits"] else DASH,
                       "yellow" if r["waits"] else "")
             return
-        # One table, state in a column — the member table's shape. Splitting ready and blocked
-        # into separate blocks made STATE invisible as a value you can scan and compare, and
-        # DELEGABLE was a third rendering of rows already on screen. HANDS answers it instead.
+        # deliberate — one table, STATE as a scannable column, see NOTES.md#tasks-one-table
         t = Table(box=box.SIMPLE, show_edge=False, header_style="bold", border_style="grey35",
                   pad_edge=False, padding=(0, 1))
         t.add_column("TASK", style="bold", no_wrap=True)
@@ -2094,8 +1655,7 @@ def render(rows, meta):
         t.add_column("SCOPE", no_wrap=True)
         t.add_column("HANDS", no_wrap=True)
         t.add_column("STATE", justify="center", no_wrap=True, min_width=7)
-        # Blank unless something is actually holding this up, so the absence of a blocker is as
-        # visible as its presence — the same reasoning as FAULT.
+        # blank unless something is holding this up — same reasoning as FAULT
         t.add_column("WAITS ON", style="yellow", no_wrap=True)
         t.add_column("SUMMARY", style="cyan")
         HANDS = {"Claude": "cyan", "Harry": "default", "Either": "magenta"}
@@ -2113,20 +1673,14 @@ def render(rows, meta):
         out.print(rule); out.print(t); out.print(rule)
         return
 
-    # SIMPLE without an edge is the only box that starts at column 0 — every bordered style
-    # reserves a blank edge column and indents the whole block by one. It gives the rule under
-    # the header; the rules above and below are drawn here, at the table's measured width.
+    # deliberate — SIMPLE/no-edge is the only box starting at column 0, see NOTES.md#table-box-choice
     t = Table(box=box.SIMPLE, show_edge=False, header_style="bold", border_style="grey35",
               pad_edge=False, padding=(0, 1))
-    # Atomic values are no_wrap so they are never broken mid-token; the state columns carry a
-    # min_width floor. Narrowing therefore lands on CREDENTIAL, which has wrap points, instead
-    # of collapsing the columns that answer the actual question.
+    # atomic values no_wrap; narrowing lands on CREDENTIAL (has wrap points), not the state columns
     t.add_column("HOST", style="bold", no_wrap=True)
     t.add_column("TYPE", no_wrap=True)
     t.add_column("ADDRESS", no_wrap=True)
-    # Zone sits beside the address because it qualifies it: it is why a host is reachable, or
-    # legitimately is not. LAN cannot reach ADM, so an unreachable PLY host is the firewall
-    # working, not a fault — and without this the two are indistinguishable in the output.
+    # zone qualifies address — an unreachable PLY host may be the firewall working, not a fault
     t.add_column("ZONE", no_wrap=True)
     if SHOW_MAC:
         t.add_column("MAC", style="grey50", no_wrap=True)
@@ -2137,18 +1691,15 @@ def render(rows, meta):
     t.add_column("CHECK" if SHOW_CHECK else "ACCESS",
                  style="magenta" if SHOW_CHECK else "cyan", no_wrap=True)
     t.add_column("CREDENTIAL", style="grey50")
-    # Blank on a healthy row, so the absence of a fault is as visible as its presence. It names
-    # the field that is wrong and nothing else — the sentence explaining it lives in --json.
-    # A fault here is a defect in the VAULT ENTRY, not in the host: without it a broken URL
-    # field renders exactly like a service that legitimately has no endpoint.
+    # blank on a healthy row; names the field only, the sentence lives in --json — a vault-entry
+    # defect, never a host defect
     t.add_column("FAULT", style="red", no_wrap=True)
 
     TYPE = {"physical": "default", "virtual": "cyan", "service": "magenta",
             "unclassified": "yellow"}
     DASH = "[grey35]-[/]"
     for r in rows:
-        # Built as a list, not positional arguments, so the MAC cell can be left out entirely
-        # rather than added as a blank one — a blank column still costs its header width.
+        # built as a list so the MAC cell can be left out entirely, not added blank
         cells = [r["name"],
                  f"[{TYPE.get(r['type'], 'yellow')}]{r['type']}[/]",
                  r.get("ip") or DASH,
@@ -2164,12 +1715,8 @@ def render(rows, meta):
                   ",".join(faults_of(r))]
         t.add_row(*cells)
 
-    # Rich compresses columns to fit the terminal, and under real pressure it will squeeze a
-    # column down to a single character — a stack of ellipses that looks like output while
-    # carrying nothing. min_width does not hold at that point. For a directory tool a mangled
-    # value is worse than an ugly one, so the table is rendered at its NATURAL width and a
-    # narrow terminal is left to soft-wrap: every value survives, legibly, at the cost of
-    # looking untidy below about 120 columns.
+    # deliberate — rendered at NATURAL width, narrow terminals soft-wrap rather than mangle,
+    # see NOTES.md#natural-width-render
     probe = Console(width=10_000, no_color=True)
     natural = Measurement.get(probe, probe.options, t).maximum
     out = con if natural <= con.width else Console(width=natural, highlight=False)
@@ -2182,9 +1729,7 @@ def render(rows, meta):
 if __name__ == "__main__":
     shown = rows                       # WANT was applied before the probes, not after them
 
-    # Token age is the age of the token FILE, not time until expiry — 1Password exposes no
-    # expiry to read. It stays in --json as a diagnostic, named for what it measures, and is
-    # kept off the table so it cannot be mistaken for a warning.
+    # token_file_age_days: age of the FILE, not time-to-expiry — 1Password exposes no expiry to read
     meta = {"vault": VAULT, "ipam_source": opn["endpoint"],
             "prober": PROBER, "prober_zone": PROBER_ZONE,
             "runtime_s": round(time.time() - _T0, 1), "off_directory": OFF_DIRECTORY,
@@ -2194,15 +1739,8 @@ if __name__ == "__main__":
         print(json.dumps({**meta, "members": [{k: r.get(k) for k in KEEP_JSON} for r in shown]},
                          indent=2))
     elif SHOW_TEST:
-        # Every view, from ONE probe pass. Running the CLI nine times would be the obvious
-        # implementation and the wrong one: it would take nine times as long, and it would
-        # fire nine rounds of SSH logins at rpi-01 and swt-01, which is how you trip the
-        # brute-force lockout that standard #13 exists to enable. Probing is the expensive and
-        # risky part; rendering is free, so it is the only part repeated.
-        #
-        # A consequence worth knowing when reading the output: every view below is the SAME
-        # measurement, so the rows agree with each other by construction. This shows what each
-        # flag renders, not that nine separate runs would agree.
+        # deliberate — one probe pass, nine renders; running the CLI nine times would trip
+        # SSH brute-force lockout, see NOTES.md#show-test-one-pass
         VIEWS = [
             ("wblv-lab",               set(),          False, False),
             ("wblv-lab -p",            {"physical"},   False, False),
@@ -2218,12 +1756,9 @@ if __name__ == "__main__":
             SHOW_MAC, SHOW_CHECK = mac, chk
             print(f"\n{'=' * 78}\n$ {label}\n{'=' * 78}")
             render([r for r in shown if not want or r["type"] in want], meta)
-        # These swap the table rather than filtering it, so they cannot ride the loop above:
-        # the loop varies which MEMBERS are shown, these vary what the table IS. Same single
-        # probe pass, so every view still agrees with every other by construction.
+        # these vary what the table IS, not which members show — can't ride the loop above
         SHOW_MAC = SHOW_CHECK = False
-        # --brief FIRST, because it is the view the session hook actually reads. It was the one
-        # view --test did not cover, which is the wrong way round for a whole-surface check.
+        # --brief FIRST — the view the session hook actually reads
         SHOW_BRIEF = True
         print(f"\n{'=' * 78}\n$ wblv-lab --brief\n{'=' * 78}")
         render(shown, meta)
@@ -2231,8 +1766,7 @@ if __name__ == "__main__":
         SHOW_TASKS = True
         print(f"\n{'=' * 78}\n$ wblv-lab --tasks\n{'=' * 78}")
         render(shown, meta)
-        # A real id, taken from the snapshot rather than hardcoded: a literal would rot the
-        # first time that task closed, and the check would then pass by printing "not found".
+        # real id from the snapshot, not hardcoded — a literal rots the first time that task closes
         _t = tasks_snapshot()
         _id = (_t["ready"] + _t["blocked"])[0]["id"] if isinstance(_t, dict) and (_t["ready"] or _t["blocked"]) else None
         if _id:
