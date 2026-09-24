@@ -2,7 +2,7 @@
 
 **A dynamic information and context tool for Claude Code.**
 
-`wblv-lab` tells you what is alive in the lab and how to reach it. That is all it does.
+`wblv-lab` tells you what is alive in the lab and how to reach it.
 
 ```
 wblv-lab            every host and service
