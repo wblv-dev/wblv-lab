@@ -185,7 +185,7 @@ says which was exercised.
 else, so it can never become a place where a wrong value is massaged into a plausible one. It
 exists because the estate has produced three credentials that were correct and unusable: the
 OPNsense `key=`/`secret=` prefix, the Aruba key rendered quoted and newline-led by `--fields`,
-and a PVE token id stored as `'" claude@pve!mac01"'`. Every one of them failed as a 401 or a
+and a PVE token id stored as `'" user@pve!tokenid"'`. Every one of them failed as a 401 or a
 Permission denied — the far end saying no to something it was never sent properly. The PVE
 token's SHAPE (`USER@REALM!TOKENID`, and a UUID) is checked offline before spending an auth
 attempt, for the same reason.
@@ -479,7 +479,7 @@ WHERE was never the problem.
 ## howto-soft-wrap
 These are commands to be PASTED, not prose to be laid out. With a non-tty console the width is
 `COLUMNS` (the session hook sets 150), and rich was wrapping the longest recipe mid-argument —
-`--vault \n Lab-Claude` — so the one line most likely to be copied verbatim was the one line
+`--vault \n <vault-name>` — so the one line most likely to be copied verbatim was the one line
 that couldn't be. A wrapped recipe fails as a shell error attributable to the host, sending the
 reader to debug a login that was never actually attempted.
 

@@ -124,8 +124,8 @@ measured, and for a service it never was. `--check` swaps it for what was actual
 contacted:
 
 ```
-rpi-01   physical   up     ok    ssh claude@rpi-01.wblv.uk (3)
-wap-01   physical   down   -     tcp wap-01.wblv.uk:443 (2)
+rpi-01   physical   up     ok    ssh readonly@rpi-01.lab.example (3)
+wap-01   physical   down   -     tcp wap-01.lab.example:443 (2)
 365-01   service    up     ok    login.microsoftonline.com (4)
 git-01   service    up     ok    api.github.com (4)
 ops-01   service    up     ok    op whoami
