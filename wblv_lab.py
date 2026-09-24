@@ -515,11 +515,23 @@ def classify(m):
 
 # --- REACH and AUTH: measured, never recorded ----------------------------------------------
 def nc_open(host, port, t=3):
-    return subprocess.run(["nc", "-z", "-G", str(t), "-w", str(t), host, str(port)],
-                          capture_output=True).returncode == 0
+    """A DROPPED SYN never returns: macOS nc ignores -G and -w, so the caller must bound it.
+
+    deliberate — the flags are kept in case Apple honours them, see NOTES.md#nc-ignores-its-own-timeouts"""
+    try:
+        return subprocess.run(["nc", "-z", "-G", str(t), "-w", str(t), host, str(port)],
+                              capture_output=True, timeout=t + 1).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False       # no answer inside t is exactly what "not open" means
 
 def ping_ok(host, t=2):
-    return subprocess.run(["ping", "-c", "1", "-t", str(t), host], capture_output=True).returncode == 0
+    # ping -t IS honoured today. So was nc -G, right up until a dropped SYN proved otherwise:
+    # the bound belongs here, where no vendor can withdraw it. NOTES.md#nc-ignores-its-own-timeouts
+    try:
+        return subprocess.run(["ping", "-c", "1", "-t", str(t), host],
+                              capture_output=True, timeout=t + 1).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 # These four literals are exactly the ones that were got wrong by hand — each is now named
 # once and referenced by BOTH the probe that uses it and the recipe that documents it, so a
@@ -602,10 +614,18 @@ def aruba_probe(user, host, pw, private_key=None):
         os.chmod(keyfile, 0o600)
         # ⚠ deliberate — offline key-shape check before spending an auth attempt,
         # see NOTES.md#aruba-key-quoting
-        if subprocess.run(["ssh-keygen", "-y", "-f", keyfile], capture_output=True).returncode:
+        # An ENCRYPTED key makes ssh-keygen wait on a passphrase prompt for ever — measured.
+        # A probe may not block on a terminal nobody is watching.
+        try:
+            _shape = subprocess.run(["ssh-keygen", "-y", "-f", keyfile],
+                                    capture_output=True, stdin=subprocess.DEVNULL, timeout=5)
+            _bad, _why = _shape.returncode, "(malformed)"
+        except subprocess.TimeoutExpired:
+            _bad, _why = 1, "(it asks for a passphrase, so it cannot be used unattended)"
+        if _bad:
             os.unlink(keyfile)
             return None, ("private key material on the item is not a usable key file "
-                          "(malformed); nothing was sent, so this is untested, not rejected")
+                          f"{_why}; nothing was sent, so this is untested, not rejected")
         # deliberate — IdentitiesOnly/IdentityAgent=none pin THIS key; RSA sig-algs needed for
         # Mocana SSH 6.3 — see NOTES.md#aruba-rsa-sig-algs
         opts = base + ("-o PasswordAuthentication=no -o PreferredAuthentications=publickey "
@@ -1238,6 +1258,13 @@ def jira_snapshot(rows):
             return False
     elif len(projects) == 1:
         proj = projects[0]
+    elif not projects:
+        # ⚠ A permission-filtered read returns 200 with an empty list, so "no projects" and
+        # "this token may no longer see them" are the same bytes. AUTH proves the login, never
+        # the visibility — say both, and never advise a vault edit that cannot help.
+        TASKS_WHY.append("this credential sees no projects — either the site has none, or the "
+                         "token's scope was reduced. AUTH proves the login, not the visibility")
+        return False
     else:
         TASKS_WHY.append(f"{len(projects)} projects visible and the vault item names none — "
                          f"add a Project field to the item ({', '.join(p['key'] for p in projects[:6])})")
