@@ -13,8 +13,14 @@ dependencies = ["rich<16", "pexpect<5"]
 [project.optional-dependencies]
 test = ["pytest"]
 
+[project.scripts]
+wblv-lab = "wblv_lab.cli:run"
+
 [tool.setuptools]
 packages = ["wblv_lab"]          # explicit: legacy/ and tests/ are not part of the package
+
+[tool.setuptools.package-data]
+wblv_lab = ["config.example.toml"]   # --init writes this; must ship with the package
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -7,6 +7,7 @@ import pytest
 from wblv_lab import config as C
 
 REPO = Path(__file__).resolve().parent.parent
+EXAMPLE = REPO / "wblv_lab" / "config.example.toml"
 MINIMAL = '[secrets]\nvault = "Lab Directory"\n'
 
 
@@ -219,7 +220,9 @@ def test_env_var_missing_does_not_fall_back(tmp_path):
 # --- the shipped example stays valid and neutral --------------------------------------------
 
 def test_example_config_is_valid_and_matches_defaults(tmp_path):
-    text = (REPO / "config.example.toml").read_text(encoding="utf-8")
+    text = EXAMPLE.read_text(encoding="utf-8")
+    assert "\n# vault" in text                     # shipped unset: the user must choose one
+    text = text.replace("\n# vault", "\nvault", 1)
     cfg = C.load(write(tmp_path, text))
     ref = C.load(write(tmp_path, MINIMAL, "ref.toml"))
     for section in ("membership", "fields", "ipam", "probing", "faults", "classify", "output"):
@@ -230,6 +233,5 @@ def test_no_assistant_names_in_defaults_or_example():
     """AI-agnostic: no assistant or vendor-of-assistant names baked into conventions."""
     banned = re.compile(r"claude|anthropic|openai|chatgpt|gpt-|qwen|deepseek|copilot|gemini",
                         re.I)
-    blob = repr(C.Config(secrets=C.Secrets(vault="x"))) + \
-        (REPO / "config.example.toml").read_text(encoding="utf-8")
+    blob = repr(C.Config(secrets=C.Secrets(vault="x"))) + EXAMPLE.read_text(encoding="utf-8")
     assert not banned.search(blob), banned.search(blob).group(0)

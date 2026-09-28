@@ -41,6 +41,18 @@ class ConfigError(Exception):
                          + "\n  ".join(self.problems))
 
 
+class ConfigNotFound(ConfigError):
+    """No file where the config was looked for. `why` says which rule chose `path`, because
+    "nothing at the default location" (not set up yet) and "nothing at the path you named"
+    (a typo) are different situations — see NOTES.md#cli-unconfigured-is-not-empty."""
+
+    DEFAULT = "default location"
+
+    def __init__(self, path: Path, why: str):
+        self.path, self.why = path, why
+        super().__init__([f"no config file at {path} (from {why})"])
+
+
 # --- schema ---------------------------------------------------------------------------------
 # Constraints ride in field metadata: choices, pattern, min, max. `internal` fields are set by
 # the loader and may not appear in the file.
@@ -144,24 +156,29 @@ class Config:
 
 # --- location -------------------------------------------------------------------------------
 
-def locate(explicit: str | os.PathLike | None = None,
-           env: typing.Mapping[str, str] | None = None) -> Path:
-    """The ONE place the config is read from. Precedence: explicit path, then $WBLV_LAB_CONFIG,
-    then $XDG_CONFIG_HOME (or ~/.config)/wblv-lab/config.toml.
-
-    Whichever applies first is the answer — if it does not exist, that is an error. It never
-    falls through to the next candidate. See NOTES.md#config-no-fallback-location."""
+def resolve(explicit: str | os.PathLike | None = None,
+            env: typing.Mapping[str, str] | None = None) -> tuple[Path, str]:
+    """Where the config IS, by rule — whether or not a file exists there yet. Precedence:
+    explicit path, then $WBLV_LAB_CONFIG, then $XDG_CONFIG_HOME (or ~/.config)/wblv-lab/config.toml.
+    Returns (path, which rule chose it)."""
     env = os.environ if env is None else env
     if explicit:
-        p, why = Path(explicit).expanduser(), "--config"
-    elif env.get(ENV_VAR):
-        p, why = Path(env[ENV_VAR]).expanduser(), f"${ENV_VAR}"
-    else:
-        base = Path(env["XDG_CONFIG_HOME"]).expanduser() if env.get("XDG_CONFIG_HOME") \
-            else Path.home() / ".config"
-        p, why = base / APP_DIR / FILE_NAME, "default location"
+        return Path(explicit).expanduser(), "--config"
+    if env.get(ENV_VAR):
+        return Path(env[ENV_VAR]).expanduser(), f"${ENV_VAR}"
+    base = Path(env["XDG_CONFIG_HOME"]).expanduser() if env.get("XDG_CONFIG_HOME") \
+        else Path.home() / ".config"
+    return base / APP_DIR / FILE_NAME, ConfigNotFound.DEFAULT
+
+
+def locate(explicit: str | os.PathLike | None = None,
+           env: typing.Mapping[str, str] | None = None) -> Path:
+    """The ONE place the config is read from (see resolve()). Whichever rule applies first is
+    the answer — if that file does not exist, it is an error. It never falls through to the next
+    candidate. See NOTES.md#config-no-fallback-location."""
+    p, why = resolve(explicit, env)
     if not p.is_file():
-        raise ConfigError([f"no config file at {p} (from {why})"])
+        raise ConfigNotFound(p, why)
     return p
 
 

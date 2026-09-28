@@ -8,12 +8,13 @@
 #   --config PATH  >  $WBLV_LAB_CONFIG  >  $XDG_CONFIG_HOME/wblv-lab/config.toml
 #                                          (~/.config/wblv-lab/config.toml)
 #
-# Only [secrets].vault is required. Every other value below is the default, shown so you
-# can see what is being assumed. Remove a line to take the default; an empty value is an error.
+# Only [secrets].vault is required — it is left unset below on purpose, so the tool will not
+# run until you name a vault yourself. Every other value is the default, shown so you can see
+# what is being assumed. Remove a line to take the default; an empty value is an error.
 
 [secrets]
 provider   = "1password"
-vault      = "Lab Directory"         # exact vault name or id — never matched by substring
+# vault    = "Your Vault Name"       # REQUIRED: exact vault name or id — never matched by substring
 token_file = "op-token"              # service-account token; relative = next to this file
 
 [membership]

@@ -38,6 +38,30 @@ fixed by a human editing a file; one-problem-per-run turns a four-line fix into 
 is not in tension with "one clean root cause" — the root cause is the file, and the list is
 its content.
 
+## cli-unconfigured-is-not-empty
+With no config at the default location the tool prints its normal header with every value
+as a dash, says "Not configured. Nothing was probed.", and exits 2. It does NOT print an empty
+table or `Hosts: 0`: a zero is a measurement ("I looked and found nothing"), and the whole
+tool is built on keeping "not measured" and "measured, nothing there" apart (legacy
+NOTES.md#empty-ipam-dies, #show-brief-exceptions). `--json` returns an `error` object, never
+`"members": []`, so a hook or an MCP client cannot mistake a fresh install for an empty lab.
+
+Only the DEFAULT location being empty is "not configured". A path someone named — `--config`
+or `$WBLV_LAB_CONFIG` — that does not exist is a typo, and is a fault (exit 1). A config that
+exists but is invalid is also a fault: someone meant to set it up, and a welcome screen would
+hide what they got wrong.
+
+## cli-init-never-overwrites
+`--init` writes the shipped example to wherever the config would be read from, creating the
+directory 0700 and the file 0600, with `O_EXCL` so it fails rather than overwrite something
+that appeared in the meantime. It refuses outright if a config exists. The example ships with
+`vault` commented out, so a fresh install cannot run until someone names a vault: a
+placeholder that loads would probe a vault nobody chose. It never creates or asks for a token.
+
+## cli-exit-codes
+0 a run completed; 1 a fault; 2 not configured. A script, hook or MCP wrapper cannot read a
+table, so "not set up yet" must be distinguishable from "broken" by the exit code alone.
+
 ## config-identity-suffixes
 The legacy tool accepted only titles ending `/CLAUDE` as the read-only identity, which put an
 assistant's name into the vault's naming convention. The suffix is now configured

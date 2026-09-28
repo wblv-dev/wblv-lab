@@ -6,3 +6,4 @@ op-token
 *.token
 .env
 *.egg-info/
+build/
