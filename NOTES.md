@@ -51,6 +51,14 @@ or `$WBLV_LAB_CONFIG` — that does not exist is a typo, and is a fault (exit 1)
 exists but is invalid is also a fault: someone meant to set it up, and a welcome screen would
 hide what they got wrong.
 
+## cli-vault-unset-is-unfinished
+A config whose ONLY problem is a missing `[secrets].vault` is the file `--init` wrote, not yet
+finished: it gets the dashed "Setup not finished" screen with the next steps, and exit 2 like
+no config at all. It is not an exception to cli-unconfigured-is-not-empty's "an invalid
+config is a fault": nothing was set wrong, one thing was not set yet, and a hook reading exit
+2 learns the truth — not set up. The moment anything else is also wrong, the whole list is
+reported as a fault (exit 1), because someone has started editing and needs to see all of it.
+
 ## cli-init-never-overwrites
 `--init` writes the shipped example to wherever the config would be read from, creating the
 directory 0700 and the file 0600, with `O_EXCL` so it fails rather than overwrite something

@@ -142,6 +142,20 @@ def die(msg: str, json_mode: bool, lines: list[str] | None = None, **extra) -> i
     return EXIT_FAULT
 
 
+def _dashed(con, config_line: str) -> None:
+    """The normal header with every measured field a dash — nothing was probed."""
+    DASH = "[grey35]-[/]"
+    _field(con, "Time", _now())
+    _field(con, "Config", config_line)
+    _field(con, "Vault", DASH)
+    _field(con, "Source", DASH)
+    _field(con, "Probing from", _prober())
+    con.print()
+    for label in ("Hosts", "Services", "Reachable", "Authenticated", "Faults", "Non-members"):
+        _field(con, label, DASH)
+    con.print()
+
+
 def unconfigured(e: C.ConfigNotFound, json_mode: bool) -> int:
     """Nothing was probed, and the output must say so in every field — dashes, never zeros.
     A zero is a measurement; see NOTES.md#cli-unconfigured-is-not-empty."""
@@ -151,21 +165,38 @@ def unconfigured(e: C.ConfigNotFound, json_mode: bool) -> int:
                           "config_from": e.why, "hint": hint}, indent=2))
         return EXIT_UNCONFIGURED
     con = _console()
-    DASH = "[grey35]-[/]"
-    _field(con, "Time", _now())
-    _field(con, "Config", f"[yellow]not found[/] — {e.path} [dim]({e.why})[/]")
-    _field(con, "Vault", DASH)
-    _field(con, "Source", DASH)
-    _field(con, "Probing from", _prober())
-    con.print()
-    for label in ("Hosts", "Services", "Reachable", "Authenticated", "Faults", "Non-members"):
-        _field(con, label, DASH)
-    con.print()
+    _dashed(con, f"[yellow]not found[/] — {e.path} [dim]({e.why})[/]")
     con.print("[bold yellow]Not configured. Nothing was probed.[/]")
     con.print(f"  Create one:       [cyan]wblv-lab --init[/]   [dim]writes {e.path}[/]")
     con.print(f"  Or point at one:  [cyan]wblv-lab --config PATH[/]  [dim]or[/]  "
               f"[cyan]export {C.ENV_VAR}=PATH[/]")
     con.print("  Only [bold]\\[secrets].vault[/] is required.")
+    return EXIT_UNCONFIGURED
+
+
+VAULT_UNSET = "secrets.vault: required key is missing"
+
+
+def _vault_unset(e: C.ConfigError) -> bool:
+    """The file --init wrote, with only the vault left to choose: setup not finished, not a
+    broken config. Anything else wrong alongside it is a fault. NOTES.md#cli-vault-unset-is-unfinished"""
+    return e.problems == [VAULT_UNSET]
+
+
+def unfinished(e: C.ConfigError, json_mode: bool) -> int:
+    if json_mode:
+        print(json.dumps({"error": "not configured", "reason": "vault not set",
+                          "config_path": str(e.source),
+                          "hint": "set [secrets].vault to the vault's exact name"}, indent=2))
+        return EXIT_UNCONFIGURED
+    con = _console()
+    _dashed(con, f"{e.source} [yellow](no vault set yet)[/]")
+    con.print("[bold yellow]Setup not finished: no vault chosen yet. Nothing was probed.[/]")
+    con.print(f"  1. edit [cyan]{e.source}[/]")
+    con.print("     under [bold]\\[secrets][/], uncomment [bold]vault[/] and set it to your "
+              "vault's exact name")
+    con.print("  2. [cyan]wblv-lab --unlock[/]   [dim]paste the service-account token (hidden)[/]")
+    con.print("  3. [cyan]wblv-lab[/]")
     return EXIT_UNCONFIGURED
 
 
@@ -205,6 +236,10 @@ def _load_for_action(opts, env, json_mode):
             return None, EXIT_UNCONFIGURED
         return None, die(e.problems[0], json_mode)
     except C.ConfigError as e:
+        if _vault_unset(e):
+            die("setup not finished — set [secrets].vault first", json_mode,
+                config=str(e.source))
+            return None, EXIT_UNCONFIGURED
         return None, die(f"invalid config {e.source}", json_mode, lines=e.problems)
 
 
@@ -299,6 +334,8 @@ def main(argv: list[str] | None = None, env=None, provider_factory=None, stdin=N
         # a path someone NAMED that is not there is a typo, not a first run
         return die(e.problems[0], json_mode)
     except C.ConfigError as e:
+        if _vault_unset(e):
+            return unfinished(e, json_mode)
         return die(f"invalid config {e.source}", json_mode, lines=e.problems)
 
     from . import members as M

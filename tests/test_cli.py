@@ -48,6 +48,42 @@ def test_unconfigured_json_is_an_error_not_an_empty_directory(env, capsys):
     assert j["config_from"] == "default location"
 
 
+def test_fresh_init_is_unfinished_not_invalid(env, capsys):
+    """Straight after --init the only gap is the vault: that is setup to finish, not a fault."""
+    assert run(["--init"], env, capsys)[0] == 0
+    code, out, err = run([], env, capsys)
+    assert code == cli.EXIT_UNCONFIGURED
+    assert "Setup not finished" in out and "invalid config" not in err
+    assert str(default_path(env)) in out and "wblv-lab --unlock" in out
+    line = next(l for l in out.splitlines() if l.startswith("Hosts:"))
+    assert line.split(":", 1)[1].strip() == "-"                  # a dash, never 0
+
+
+def test_fresh_init_json(env, capsys):
+    run(["--init"], env, capsys)
+    code, out, _ = run(["--json"], env, capsys)
+    j = json.loads(out)
+    assert code == 2 and j["error"] == "not configured" and j["reason"] == "vault not set"
+    assert j["config_path"] == str(default_path(env)) and "members" not in j
+
+
+def test_vault_unset_plus_another_problem_is_a_fault(env, capsys):
+    p = default_path(env); p.parent.mkdir(parents=True)
+    p.write_text("""[secrets]
+[probing]
+concurrency = 0
+""", encoding="utf-8")
+    code, _, err = run([], env, capsys)
+    assert code == cli.EXIT_FAULT and "invalid config" in err
+    assert "secrets.vault: required key is missing" in err and "outside 1..64" in err
+
+
+def test_unlock_before_vault_is_set(env, capsys):
+    run(["--init"], env, capsys)
+    code, _, err = run(["--unlock"], env, capsys)
+    assert code == 2 and "set [secrets].vault first" in err
+
+
 def test_named_config_missing_is_a_fault_not_a_first_run(env, tmp_path, capsys):
     code, _, err = run(["--config", str(tmp_path / "typo.toml")], env, capsys)
     assert code == cli.EXIT_FAULT
@@ -87,9 +123,9 @@ def test_init_output_is_not_yet_a_valid_config(env, capsys):
     """The starter file must force a real choice of vault — a placeholder that loads would let
     a fresh install probe a vault nobody chose."""
     run(["--init"], env, capsys)
-    code, _, err = run([], env, capsys)
-    assert code == 1
-    assert "secrets.vault: required key is missing" in err
+    code, out, _ = run([], env, capsys)
+    assert code == cli.EXIT_UNCONFIGURED
+    assert "Nothing was probed" in out and "Vault view" not in out
 
 
 def test_init_rejects_view_flags(env, capsys):
@@ -112,10 +148,11 @@ def test_broken_config_lists_every_problem(env, capsys):
 def test_broken_config_json(env, capsys):
     p = default_path(env)
     p.parent.mkdir(parents=True)
-    p.write_text("[secrets]\n", encoding="utf-8")
+    p.write_text('[secrets]\nvault = ""\n', encoding="utf-8")
     code, out, _ = run(["--json"], env, capsys)
     j = json.loads(out)
-    assert code == 1 and j["problems"] == ["secrets.vault: required key is missing"]
+    assert code == 1 and j["error"].startswith("invalid config")
+    assert len(j["problems"]) == 1 and "is empty" in j["problems"][0]
 
 
 def test_valid_config_without_token_is_one_root_cause(env, capsys):
