@@ -26,15 +26,21 @@ lab and how to reach it. Read `legacy/README.md` before changing anything.
 
 ## Out of scope
 
-- **Task management is decommissioned.** `legacy/` contains Jira/`--tasks` code
-  (`jira_snapshot`, `auth_probe_jira`, the jira `tenant_reach` branch, `--tasks` rendering).
-  Do not port any of it, and do not add a tasks module, flag or config section.
+- **Jira and task management are decommissioned.** Upstream already removed the task plane;
+  `legacy/wblv_lab.py` still carries the Jira *platform* (`auth_probe_jira`, the jira branch of
+  `tenant_reach`, the jira `--howto` recipe). Do not port any of it, and do not add a Jira
+  platform, a tasks module, flag or config section. `NOTES.md` `jira-*` and `tasks-*` entries
+  are history only.
 
 ## Working rules
 
-- `legacy/` is the original implementation, kept verbatim as reference. Do not edit it.
-- Comments marked `deliberate` or `⚠ deliberate` encode a past incident. Preserve the
-  behaviour when porting, even if it looks odd; ask before changing it.
+- `legacy/` is a verbatim snapshot of upstream `wblv-dev/wblv-lab` at `d0db7d9`
+  (2026-09-24): `wblv_lab.py`, `wblv_lab_mcp.py`, `README.md`, `NOTES.md`,
+  `templates/member.json`, `LICENSE`. Do not edit it. Full history (78 commits) is in
+  `../wblv-lab-upstream` — use `git log -p` there to see why a line exists.
+- Comments marked `deliberate` or `⚠ deliberate` point at a `legacy/NOTES.md#anchor`. Read
+  that entry before porting the line; preserve the behaviour even if it looks odd, and ask
+  before changing it. Carry the rationale forward into the new code's comments or NOTES.
 - Unknown CLI flags and unknown config keys must fail loudly, never be ignored.
 - This sandbox has no lab network access and no 1Password token by design. Write code and
   offline tests (fixtures of API responses); do not try to reach lab hosts.
