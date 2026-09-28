@@ -62,6 +62,9 @@ class Secrets:
     vault: str                                   # exact name or id — required, never guessed
     provider: str = field(default="1password", metadata={"choices": SECRET_PROVIDERS})
     token_file: Path = Path("op-token")          # relative paths resolve against the config dir
+    # Per call to the provider. Bounded because an external tool's own timeout is not a
+    # guarantee (legacy NOTES.md#nc-ignores-its-own-timeouts).
+    timeout_s: int = field(default=15, metadata={"min": 1, "max": 120})
 
 
 @dataclass(frozen=True)

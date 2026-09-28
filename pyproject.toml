@@ -17,7 +17,7 @@ test = ["pytest"]
 wblv-lab = "wblv_lab.cli:run"
 
 [tool.setuptools]
-packages = ["wblv_lab"]          # explicit: legacy/ and tests/ are not part of the package
+packages = ["wblv_lab", "wblv_lab.secrets"]          # explicit: legacy/ and tests/ are not part of the package
 
 [tool.setuptools.package-data]
 wblv_lab = ["config.example.toml"]   # --init writes this; must ship with the package

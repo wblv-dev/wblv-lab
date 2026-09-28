@@ -62,6 +62,39 @@ placeholder that loads would probe a vault nobody chose. It never creates or ask
 0 a run completed; 1 a fault; 2 not configured. A script, hook or MCP wrapper cannot read a
 table, so "not set up yet" must be distinguishable from "broken" by the exit code alone.
 
+## provider-shape-not-meaning
+A secrets provider returns shapes — items, fields, labelled URLs — and nothing else. What a
+field MEANS (DNS Name is the identity, Platform selects the probe, a "/BACKUP" title is not
+the read-only identity) is decided once, in `members.py`. That split is what lets someone add
+Bitwarden or HashiCorp Vault as one module without re-deriving every rule the vault layer
+learned the hard way.
+
+## item-read-failure-is-not-empty
+An item that is listed but whose `op item get` timed out, was refused, or answered with
+something unparseable becomes a `ReadFailure`, reported by name and reason. The legacy tool
+parsed a failed read as `{}`, which produced a member with no endpoint — indistinguishable
+from an item that genuinely has none. One bad item does not sink the others, and it is never
+silently dropped.
+
+## token-file-mode
+The token file must be mode 600 (no group/other bits) or the tool refuses before the token is
+used. It is a read credential for every member in the vault; a world-readable copy is the
+kind of exposure that goes unnoticed until it matters. The fix is named in the error.
+
+## vault-exact-match
+`[secrets].vault` matches a vault's exact name or id. The legacy tool picked the first vault
+whose name CONTAINED a word, so adding a second vault with a similar name could silently
+switch the whole directory to it. Two vaults with the same name are an error that asks for the
+id. "Cannot see the vault" lists what the token CAN see, because a mis-scoped token and a
+misspelt name look identical otherwise.
+
+## cli-vault-view-is-incomplete
+Until the IPAM and probes exist, a configured run shows the VAULT VIEW: what the vault
+declares, with every measured column as a dash, the words "nothing was probed", and exit 1.
+`--json` returns it under an `error` key with `vault_members`, never `members`, so no consumer
+can mistake a declaration for a measurement. Credentials are out of scope in this view — it
+is built from Member fields only.
+
 ## config-identity-suffixes
 The legacy tool accepted only titles ending `/CLAUDE` as the read-only identity, which put an
 assistant's name into the vault's naming convention. The suffix is now configured

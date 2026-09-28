@@ -118,12 +118,61 @@ def test_broken_config_json(env, capsys):
     assert code == 1 and j["problems"] == ["secrets.vault: required key is missing"]
 
 
-def test_valid_config_does_not_pretend_to_have_results(env, capsys):
+def test_valid_config_without_token_is_one_root_cause(env, capsys):
     p = default_path(env)
     p.parent.mkdir(parents=True)
     p.write_text('[secrets]\nvault = "Lab Directory"\n', encoding="utf-8")
     code, out, err = run([], env, capsys)
-    assert code == 1 and out == "" and "cannot read the lab yet" in err
+    assert code == 1 and out == ""
+    assert "secrets substrate check failed: token file not found" in err
+
+
+# --- vault view (1Password layer, offline) --------------------------------------------------
+
+def _configured(env, token_file):
+    from conftest import VAULT
+    p = default_path(env)
+    p.parent.mkdir(parents=True)
+    p.write_text(f'[secrets]\nvault = "{VAULT["name"]}"\ntoken_file = "{token_file}"\n'
+                 '[membership]\nidentity_suffixes = ["/READONLY", "/LEGACY"]\n',
+                 encoding="utf-8")
+
+
+def _fake_factory(cfg):
+    from conftest import FakeOp
+    from wblv_lab.secrets.onepassword import OnePassword
+    return OnePassword(cfg, runner=FakeOp(), which=lambda _: "/usr/bin/op")
+
+
+def test_vault_view_lists_members_and_says_nothing_was_probed(env, token_file, capsys):
+    from conftest import SECRET_VALUES
+    _configured(env, token_file)
+    code = cli.main([], env, provider_factory=_fake_factory)
+    out = capsys.readouterr().out
+    assert code == 1
+    for name in ("host-01", "svc-01", "nas-01", "bad-01", "mis-01", "old-01"):
+        assert name in out
+    assert "skipped (not the read-only identity): TEST-HOST-01 / BACKUP" in out
+    assert "unreadable: TEST-FAIL-01" in out
+    assert "Vault view only." in out and "nothing was probed" in out
+    bad = next(l for l in out.splitlines() if l.startswith("bad-01"))
+    assert bad.rstrip().endswith("url")
+    for s in SECRET_VALUES:
+        assert s not in out, s
+
+
+def test_vault_view_json_is_an_error_with_no_secrets(env, token_file, capsys):
+    from conftest import SECRET_VALUES
+    _configured(env, token_file)
+    code = cli.main(["--json"], env, provider_factory=_fake_factory)
+    out = capsys.readouterr().out
+    j = json.loads(out)
+    assert code == 1 and j["error"].startswith("incomplete")
+    assert "members" not in j                     # never mistakable for a directory
+    faults = {m["name"]: m["faults"] for m in j["vault_members"]}
+    assert faults["bad-01"] == ["url"] and faults["mis-01"] == ["name"]
+    for s in SECRET_VALUES:
+        assert s not in out, s
 
 
 # --- flags ----------------------------------------------------------------------------------

@@ -189,7 +189,7 @@ def do_init(opts: dict, env, json_mode: bool) -> int:
 
 # --- entry ----------------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None, env=None) -> int:
+def main(argv: list[str] | None = None, env=None, provider_factory=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     env = os.environ if env is None else env
     # help is read before any work, and before flag validation, so it always answers
@@ -215,11 +215,76 @@ def main(argv: list[str] | None = None, env=None) -> int:
     except C.ConfigError as e:
         return die(f"invalid config {e.source}", json_mode, lines=e.problems)
 
-    # The directory itself (vault -> IPAM -> probes -> table) is the next layer to be built.
-    # Until it exists, a valid config must not render anything that looks like a result.
-    return die("configured, but this build cannot read the lab yet — the member directory "
-               "is still being written", json_mode, config=str(cfg.source),
-               vault=cfg.secrets.vault)
+    from . import members as M
+    from .secrets import SecretsError, open_provider
+    try:
+        prov = (provider_factory or open_provider)(cfg)
+        ident = prov.check()
+        vault = prov.resolve_vault()
+        keep, skipped = M.select(prov.list_items(), cfg)
+        directory = M.build(prov.get_items(keep), skipped, cfg)
+    except SecretsError as e:
+        return die(f"secrets substrate check failed: {e.cause}", json_mode, **e.detail)
+
+    # The IPAM and the probes are the next layers. Until they exist this is the VAULT VIEW:
+    # it shows what the vault declares and says plainly that nothing was probed.
+    return vault_view(cfg, vault, ident, directory, json_mode)
+
+
+def vault_view(cfg, vault, ident, d, json_mode) -> int:
+    """What the vault declares, before any probe — see NOTES.md#cli-vault-view-is-incomplete.
+    Built from Member fields only; credentials are never in scope here."""
+    why = "incomplete: IPAM and probes are not built yet — nothing was probed"
+    faults = {m.id: [f for f, bad in (("url", m.endpoint_malformed), ("name", m.name_mismatch),
+                                      ("expiry", m.cred_expiry is not None
+                                       and m.cred_expiry <= cfg.faults.expiry_warn_days),
+                                      ("dup", m.name in d.collisions())) if bad]
+              for m in d.members}
+    if json_mode:
+        print(json.dumps({
+            "error": why, "vault": vault, "vault_account": ident.account,
+            "config": str(cfg.source),
+            "vault_members": [{"name": m.name, "item": m.item, "platform": m.platform,
+                               "role": m.role, "endpoint": m.endpoint, "website": m.website,
+                               "tags": list(m.tags), "cred_expiry": m.cred_expiry,
+                               "faults": faults[m.id]} for m in d.members],
+            "skipped": [s.title for s in d.skipped],
+            "unreadable": [{"item": u.title, "reason": u.reason} for u in d.unreadable]},
+            indent=2))
+        return EXIT_FAULT
+    from rich import box
+    from rich.table import Table
+    con = _console(cfg)
+    DASH = "[grey35]-[/]"
+    _field(con, "Time", _now())
+    _field(con, "Config", str(cfg.source))
+    _field(con, "Vault", f"{vault}  [dim]({ident.detail})[/]")
+    _field(con, "Source", DASH)
+    _field(con, "Probing from", _prober())
+    con.print()
+    _field(con, "Members", f"{len(d.members)} declared in the vault")
+    _field(con, "Reachable", DASH)
+    _field(con, "Authenticated", DASH)
+    con.print()
+    t = Table(box=box.SIMPLE, show_edge=False, header_style="bold", pad_edge=False,
+              padding=(0, 1))
+    for col in ("MEMBER", "TAG", "PLATFORM", "ACCESS", "CREDENTIAL", "FAULT"):
+        t.add_column(col, no_wrap=col != "CREDENTIAL",
+                     style={"ACCESS": "cyan", "CREDENTIAL": "grey50", "FAULT": "red"}.get(col, ""))
+    tags = cfg.membership.type_tags
+    known = {tags.physical, tags.virtual, tags.service}
+    for m in sorted(d.members, key=lambda m: m.name):
+        tag = next((x for x in m.tags if x in known), "")
+        t.add_row(m.name, tag or DASH, m.platform or DASH, m.website or DASH, m.item,
+                  ",".join(faults[m.id]))
+    con.print(t)
+    for s in d.skipped:
+        con.print(f"[dim]skipped (not the read-only identity): {s.title}[/]")
+    for u in d.unreadable:
+        con.print(f"[yellow]unreadable: {u.title} — {u.reason}[/]")
+    con.print()
+    con.print(f"[bold yellow]Vault view only.[/] {why.split(': ', 1)[1]}.")
+    return EXIT_FAULT
 
 
 def run() -> None:

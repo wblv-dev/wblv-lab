@@ -15,7 +15,8 @@
 [secrets]
 provider   = "1password"
 # vault    = "Your Vault Name"       # REQUIRED: exact vault name or id — never matched by substring
-token_file = "op-token"              # service-account token; relative = next to this file
+token_file = "op-token"              # service-account token (chmod 600); relative = next to this file
+timeout_s  = 15                      # per call to the provider
 
 [membership]
 # A title qualified with "/" names one specific credential. Only these qualifiers are the
