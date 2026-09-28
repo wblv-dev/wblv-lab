@@ -69,7 +69,14 @@ if [ "$SYSTEM" = 1 ]; then
   [ "$(id -u)" = 0 ] || die "--system installs for every user and must run as root"
   PREFIX="/opt/wblv-lab"; BIN_DIR="/usr/local/bin"
 else
-  [ "$(id -u)" != 0 ] || die "refusing to do a per-user install as root — use --system, or run as your own user"
+  if [ "$(id -u)" = 0 ]; then
+    # Running as root without --system would install into ROOT's home, invisible to you.
+    die "running as root, so this would install into root's home, not yours.
+  For yourself (recommended; it asks for sudo only if a package is missing):
+    curl -fsSL https://raw.githubusercontent.com/wblv-dev/wblv-lab/main/install.sh | bash
+  For every user on this machine:
+    curl -fsSL https://raw.githubusercontent.com/wblv-dev/wblv-lab/main/install.sh | sudo bash -s -- --system"
+  fi
   PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/wblv-lab"; BIN_DIR="$HOME/.local/bin"
 fi
 VENV="$PREFIX/venv"
