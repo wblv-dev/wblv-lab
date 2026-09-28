@@ -22,7 +22,13 @@ lab and how to reach it. Read `legacy/README.md` before changing anything.
 - **Credentials never reach output.** Output rows are built from an explicit whitelist;
   secrets are held apart (`CREDS`) and never in argv (use stdin / `--config -`).
 - **AI-agnostic.** No assistant/vendor names in code, config keys, vault conventions or
-  output. The Jira "hands" value for the assistant is a config setting.
+  output.
+
+## Out of scope
+
+- **Task management is decommissioned.** `legacy/` contains Jira/`--tasks` code
+  (`jira_snapshot`, `auth_probe_jira`, the jira `tenant_reach` branch, `--tasks` rendering).
+  Do not port any of it, and do not add a tasks module, flag or config section.
 
 ## Working rules
 
@@ -43,8 +49,7 @@ wblv_lab/
   secrets/      1password.py      — list members, read fields
   ipam/         opnsense.py       — dnsmasq | kea | unbound backends
   probes/       one module per vendor dialect
-  tasks/        jira.py
-  render.py     table / --brief / --json / --howto / --tasks / --others
+  render.py     table / --brief / --json / --howto / --others
   cli.py        flags -> views
   mcp.py        read-only MCP wrapper
 tests/          offline, fixture-driven
