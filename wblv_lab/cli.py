@@ -22,7 +22,7 @@ EXIT_OK, EXIT_FAULT, EXIT_UNCONFIGURED = 0, 1, 2
 
 VIEW_FLAGS = ("-p", "-v", "-s", "--mac", "--check", "--json", "--test", "--brief", "--howto",
               "--others")
-ACTION_FLAGS = ("--init",)
+ACTION_FLAGS = ("--init", "--unlock", "--lock")
 VALUE_FLAGS = ("--config",)
 HELP_WORDS = ("-h", "--help", "help")
 KNOWN = VIEW_FLAGS + ACTION_FLAGS + VALUE_FLAGS + HELP_WORDS[:2]
@@ -41,6 +41,9 @@ HELP = f"""wblv-lab — what is alive in the lab, and how to reach it. Read-only
   wblv-lab --others     what is on the wire that the directory does NOT claim
   wblv-lab --test       every view in turn, from a single probe pass
   wblv-lab --init       write a starter config (never overwrites one)
+  wblv-lab --unlock     prompt for the provider token (hidden), verify it, hold it in the
+                        kernel keyring for [secrets].unlock_hours — never written to disk
+  wblv-lab --lock       drop the token from the keyring now
   wblv-lab --config PATH   use this config file
   wblv-lab -h           this text
 
@@ -91,8 +94,11 @@ def parse_args(argv: list[str]) -> dict:
                 raise Usage(f"unexpected argument: {a}")
             only = a
         i += 1
-    if "--init" in flags and flags - {"--init", "--json"}:
-        raise Usage("--init takes only --config and --json")
+    actions = flags & set(ACTION_FLAGS)
+    if len(actions) > 1:
+        raise Usage(f"choose one of {', '.join(sorted(actions))}")
+    if actions and flags - actions - {"--json"}:
+        raise Usage(f"{next(iter(actions))} takes only --config and --json")
     return {"flags": flags, "config": cfg, "only": only}
 
 
@@ -182,16 +188,92 @@ def do_init(opts: dict, env, json_mode: bool) -> int:
         print(json.dumps({"created": str(path), "config_from": why}, indent=2))
     else:
         print(f"wrote {path}\n"
-              "next:  set [secrets].vault in it, and put the secrets-provider token at the\n"
-              "       [secrets].token_file path (default: next to the config). Then run wblv-lab.")
+              "next:  1. set [secrets].vault in it\n"
+              "       2. wblv-lab --unlock     (paste the service-account token; it is hidden,\n"
+              "                                 verified, and held in memory only)\n"
+              "       3. wblv-lab")
+    return EXIT_OK
+
+
+def _load_for_action(opts, env, json_mode):
+    """(cfg, None) or (None, exit_code) — --unlock/--lock need a real config, and say so."""
+    try:
+        return C.load(opts["config"], env), None
+    except C.ConfigNotFound as e:
+        if e.why == C.ConfigNotFound.DEFAULT:
+            die("not configured — run `wblv-lab --init` first", json_mode, config=str(e.path))
+            return None, EXIT_UNCONFIGURED
+        return None, die(e.problems[0], json_mode)
+    except C.ConfigError as e:
+        return None, die(f"invalid config {e.source}", json_mode, lines=e.problems)
+
+
+def do_unlock(opts, env, json_mode, provider_factory, stdin, token_store=None) -> int:
+    """Read the token (hidden on a terminal, one line on a pipe), check its shape offline,
+    prove it with the provider, and only then keep it. See NOTES.md#unlock-verifies-before-storing."""
+    import getpass
+    from .secrets import SecretsError, open_provider
+    from .secrets.tokens import store_for, undecorate
+    cfg, code = _load_for_action(opts, env, json_mode)
+    if cfg is None:
+        return code
+    store = token_store or store_for(cfg)
+    if store.kind != "keyring":
+        return die(f'--unlock applies to token_source = "keyring" (it is "{store.kind}")',
+                   json_mode, hint=f"the token is read from {cfg.secrets.token_file}")
+    try:
+        raw = (getpass.getpass("1Password service-account token (input hidden): ")
+               if stdin.isatty() else stdin.readline())
+    except (EOFError, KeyboardInterrupt):
+        return die("no token given — nothing stored", json_mode)
+    token = undecorate(raw)
+    raw = None
+    if not token:
+        return die("no token given — nothing stored", json_mode)
+    # shape checked offline before spending a login (legacy NOTES.md#undecorate-history)
+    if not token.startswith("ops_") or any(c.isspace() for c in token):
+        return die("that does not look like a 1Password service-account token "
+                   "(they start with ops_ and contain no spaces) — nothing stored", json_mode)
+    try:
+        ident = (provider_factory or open_provider)(cfg).verify(token)
+        store.put(token)
+    except SecretsError as e:
+        return die(f"not stored: {e.cause}", json_mode, **e.detail)
+    finally:
+        token = None
+    hours = cfg.secrets.unlock_hours
+    if json_mode:
+        print(json.dumps({"unlocked": True, "account": ident.account, "hours": hours,
+                          "store": store.describe()}, indent=2))
+    else:
+        print(f"unlocked for {hours}h — {ident.detail}\n"
+              f"held in the {store.describe()}; never written to disk. "
+              "`wblv-lab --lock` drops it now.")
+    return EXIT_OK
+
+
+def do_lock(opts, env, json_mode, token_store=None) -> int:
+    from .secrets import SecretsError
+    from .secrets.tokens import store_for
+    cfg, code = _load_for_action(opts, env, json_mode)
+    if cfg is None:
+        return code
+    try:
+        had = (token_store or store_for(cfg)).clear()
+    except SecretsError as e:
+        return die(e.cause, json_mode, **e.detail)
+    msg = "locked — token removed from the keyring" if had else "already locked — nothing held"
+    print(json.dumps({"locked": True, "was_unlocked": had}) if json_mode else msg)
     return EXIT_OK
 
 
 # --- entry ----------------------------------------------------------------------------------
 
-def main(argv: list[str] | None = None, env=None, provider_factory=None) -> int:
+def main(argv: list[str] | None = None, env=None, provider_factory=None, stdin=None,
+         token_store=None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     env = os.environ if env is None else env
+    stdin = sys.stdin if stdin is None else stdin
     # help is read before any work, and before flag validation, so it always answers
     if set(HELP_WORDS) & set(argv):
         print(HELP)
@@ -204,6 +286,10 @@ def main(argv: list[str] | None = None, env=None, provider_factory=None) -> int:
 
     if "--init" in opts["flags"]:
         return do_init(opts, env, json_mode)
+    if "--unlock" in opts["flags"]:
+        return do_unlock(opts, env, json_mode, provider_factory, stdin, token_store)
+    if "--lock" in opts["flags"]:
+        return do_lock(opts, env, json_mode, token_store)
 
     try:
         cfg = C.load(opts["config"], env)

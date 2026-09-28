@@ -25,6 +25,7 @@ FILE_NAME = "config.toml"
 # Backends that exist in code today. A value naming one that does not is refused rather than
 # accepted and ignored — see NOTES.md#config-unimplemented-backends-rejected.
 SECRET_PROVIDERS = ("1password",)
+TOKEN_SOURCES = ("keyring", "file")
 IPAM_PLATFORMS = ("opnsense",)
 IPAM_HOST_BACKENDS = ("dnsmasq",)
 
@@ -61,7 +62,13 @@ class ConfigNotFound(ConfigError):
 class Secrets:
     vault: str                                   # exact name or id — required, never guessed
     provider: str = field(default="1password", metadata={"choices": SECRET_PROVIDERS})
-    token_file: Path = Path("op-token")          # relative paths resolve against the config dir
+    # Where the provider token is held. "keyring" = kernel memory only, put there by
+    # `wblv-lab --unlock`, never on disk (NOTES.md#token-never-at-rest). "file" = a mode-600 file.
+    token_source: str = field(default="keyring", metadata={"choices": TOKEN_SOURCES})
+    keyring_name: str = field(default="wblv-lab:1password",
+                              metadata={"pattern": r"[A-Za-z0-9:._-]{1,64}"})
+    unlock_hours: int = field(default=12, metadata={"min": 1, "max": 720})
+    token_file: Path = Path("op-token")          # token_source = "file" only; relative = config dir
     # Per call to the provider. Bounded because an external tool's own timeout is not a
     # guarantee (legacy NOTES.md#nc-ignores-its-own-timeouts).
     timeout_s: int = field(default=15, metadata={"min": 1, "max": 120})
@@ -201,6 +208,7 @@ def parse(data: dict, base_dir: Path, source: Path | None = None) -> Config:
     """Validate a decoded TOML document into a Config. Collects every problem, then raises."""
     problems: list[str] = []
     kwargs = _build(Config, data, "", problems, base_dir)
+    _cross_checks(data, problems)
     if problems:
         raise ConfigError(problems, source)
     cfg = Config(**kwargs, source=source)
@@ -208,6 +216,24 @@ def parse(data: dict, base_dir: Path, source: Path | None = None) -> Config:
 
 
 # --- validation -----------------------------------------------------------------------------
+
+# Settings that only mean something for one token source. Setting one for the other source is
+# refused: a value nothing reads is a file saying one thing while the tool does another
+# (NOTES.md#config-unimplemented-backends-rejected, same reasoning).
+_SOURCE_ONLY = {"token_file": "file", "keyring_name": "keyring", "unlock_hours": "keyring"}
+
+
+def _cross_checks(data, problems):
+    s = data.get("secrets") if isinstance(data, dict) else None
+    if not isinstance(s, dict):
+        return
+    src = s.get("token_source", Secrets.__dataclass_fields__["token_source"].default)
+    if src not in TOKEN_SOURCES:
+        return                                   # already reported as an unsupported choice
+    for key, only in _SOURCE_ONLY.items():
+        if key in s and src != only:
+            problems.append(f"secrets.{key}: only applies when token_source = \"{only}\" "
+                            f"(it is \"{src}\")")
 
 def _build(cls, data, where: str, problems: list[str], base_dir: Path) -> dict | None:
     if not isinstance(data, dict):

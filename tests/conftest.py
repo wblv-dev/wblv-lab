@@ -111,6 +111,41 @@ class FakeOp:
         return subprocess.CompletedProcess(argv, 0, json.dumps(out), "")
 
 
+class FakeKeyctl:
+    """Stands in for subprocess.run(['keyctl', ...]) with an in-memory @u keyring.
+    `fail` is a set of subcommands that should fail."""
+
+    def __init__(self, fail=()):
+        self.keys, self.timeouts, self.fail = {}, {}, set(fail)
+        self.calls, self.inputs = [], []
+        self._next = 100
+
+    def __call__(self, argv, input=None, **kw):
+        self.calls.append(list(argv))
+        self.inputs.append(input)
+        cmd = argv[1]
+        cp = lambda rc, out="", err="": subprocess.CompletedProcess(argv, rc, out, err)
+        if cmd in self.fail:
+            return cp(1, "", f"keyctl_{cmd}: Operation not permitted")
+        if cmd == "search":
+            kid = next((k for k, (n, _) in self.keys.items() if n == argv[4]), None)
+            return cp(0, f"{kid}\n") if kid else cp(1, "", "keyctl_search: Required key not available")
+        if cmd == "padd":
+            kid = str(self._next)
+            self._next += 1
+            self.keys[kid] = (argv[3], input)
+            return cp(0, f"{kid}\n")
+        if cmd == "pipe":
+            return cp(0, self.keys[argv[2]][1]) if argv[2] in self.keys else cp(1, "", "gone")
+        if cmd == "timeout":
+            self.timeouts[argv[2]] = int(argv[3])
+            return cp(0)
+        if cmd == "unlink":
+            self.keys.pop(argv[2], None)
+            return cp(0)
+        raise AssertionError(f"unexpected keyctl call: {argv}")
+
+
 @pytest.fixture
 def token_file(tmp_path):
     p = tmp_path / "op-token"
@@ -121,7 +156,8 @@ def token_file(tmp_path):
 
 @pytest.fixture
 def cfg(tmp_path, token_file):
-    return C.parse({"secrets": {"vault": VAULT["name"], "token_file": str(token_file)},
+    return C.parse({"secrets": {"vault": VAULT["name"], "token_source": "file",
+                                "token_file": str(token_file)},
                     "membership": {"identity_suffixes": ["/READONLY", "/LEGACY"]}},
                    base_dir=tmp_path)
 

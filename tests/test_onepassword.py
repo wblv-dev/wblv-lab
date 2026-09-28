@@ -91,7 +91,8 @@ def test_vault_by_exact_name(provider):
 
 def test_vault_by_id(tmp_path, token_file):
     from wblv_lab import config as C
-    cfg = C.parse({"secrets": {"vault": VAULT["id"], "token_file": str(token_file)}}, tmp_path)
+    cfg = C.parse({"secrets": {"vault": VAULT["id"], "token_source": "file",
+                               "token_file": str(token_file)}}, tmp_path)
     p, _ = op_with(cfg)
     p.check()
     assert p.resolve_vault() == VAULT["name"]
@@ -99,7 +100,8 @@ def test_vault_by_id(tmp_path, token_file):
 
 def test_vault_substring_does_not_match(tmp_path, token_file):
     from wblv_lab import config as C
-    cfg = C.parse({"secrets": {"vault": "Lab Directory", "token_file": str(token_file)}}, tmp_path)
+    cfg = C.parse({"secrets": {"vault": "Lab Directory", "token_source": "file",
+                               "token_file": str(token_file)}}, tmp_path)
     p, _ = op_with(cfg)
     p.check()
     with pytest.raises(SecretsError, match="cannot see a vault named 'Lab Directory'") as e:

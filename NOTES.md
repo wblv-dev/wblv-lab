@@ -76,6 +76,25 @@ parsed a failed read as `{}`, which produced a member with no endpoint — indis
 from an item that genuinely has none. One bad item does not sink the others, and it is never
 silently dropped.
 
+## token-never-at-rest
+The default token source is the Linux kernel keyring (`@u`, per user): `wblv-lab --unlock`
+reads the token with input hidden, and keyctl receives it on STDIN — never argv, never a temp
+file. It lives in kernel memory only, expires after `unlock_hours`, and is gone after a
+restart. The kernel enforces per-user isolation: another account cannot even find the key.
+That is the property that matters with an AI assistant on the same machine — the token must
+be held by a DIFFERENT user from the one the assistant runs as, because anything running as
+the same user can read the same keyring. `.env` files were considered and rejected: they are
+plain text on disk under a friendlier name. `token_source = "file"` remains for systems with
+no kernel keyring, and is refused unless its settings match (a `token_file` next to a keyring
+source is an error, not ignored).
+
+## unlock-verifies-before-storing
+`--unlock` checks the token's SHAPE offline (starts `ops_`, no whitespace, one pair of paste
+quotes stripped) and then proves it with `op whoami` BEFORE storing it. A token that fails
+either check is never kept, so the keyring can only ever hold a credential that worked at the
+moment it was put there. The expiry is set as part of storing; if it cannot be set, the token
+is taken back out — a token that would never expire is not what was asked for.
+
 ## token-file-mode
 The token file must be mode 600 (no group/other bits) or the tool refuses before the token is
 used. It is a read credential for every member in the vault; a world-readable copy is the

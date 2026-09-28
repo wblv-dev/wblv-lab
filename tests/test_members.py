@@ -154,7 +154,8 @@ def test_lone_role_still_selects_platform(cfg):
 
 
 def test_configured_labels_are_used(tmp_path, token_file):
-    cfg = C.parse({"secrets": {"vault": "v", "token_file": str(token_file)},
+    cfg = C.parse({"secrets": {"vault": "v", "token_source": "file",
+                               "token_file": str(token_file)},
                    "fields": {"dns_name": "Hostname", "platform": "Kind"}}, tmp_path)
     it = Item("i", "X", (), (Field("Hostname", "cfg-01"), Field("Kind", "linux"),
                              Field("DNS Name", "ignored-01")))

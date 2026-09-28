@@ -13,10 +13,19 @@
 # what is being assumed. Remove a line to take the default; an empty value is an error.
 
 [secrets]
-provider   = "1password"
-# vault    = "Your Vault Name"       # REQUIRED: exact vault name or id — never matched by substring
-token_file = "op-token"              # service-account token (chmod 600); relative = next to this file
-timeout_s  = 15                      # per call to the provider
+provider     = "1password"
+# vault      = "Your Vault Name"     # REQUIRED: exact vault name or id — never matched by substring
+timeout_s    = 15                    # per call to the provider
+
+# Where the service-account token is held:
+#   "keyring" — Linux kernel keyring, memory only, never written to disk. Put it there with
+#               `wblv-lab --unlock` (input hidden); it expires after unlock_hours and is gone
+#               after a restart. Readable only by the user who unlocked it.
+#   "file"    — a mode-600 file at token_file. Simpler; the token is on disk in plain text.
+token_source = "keyring"
+keyring_name = "wblv-lab:1password"  # token_source = "keyring" only
+unlock_hours = 12                    # token_source = "keyring" only
+# token_file = "op-token"            # token_source = "file" only; relative = next to this file
 
 [membership]
 # A title qualified with "/" names one specific credential. Only these qualifiers are the

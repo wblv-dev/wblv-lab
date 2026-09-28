@@ -9,12 +9,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import stat
 import subprocess
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 from . import Field, Identity, Item, ItemRef, ReadFailure, SecretsError, Url
+from .tokens import store_for
 
 TOKEN_ENV = "OP_SERVICE_ACCOUNT_TOKEN"
 INSTALL_HINT = "install the 1Password CLI: https://developer.1password.com/docs/cli/get-started/"
@@ -29,10 +28,11 @@ _AUTH_WORDS = ("unauthor", "invalid", "401", "403", "expired", "token", "not aut
 class OnePassword:
     name = "1password"
 
-    def __init__(self, cfg, runner=None, which=shutil.which):
+    def __init__(self, cfg, runner=None, which=shutil.which, token_store=None):
         self.cfg = cfg
         self._run_proc = runner or subprocess.run
         self._op = which("op")
+        self.token_store = token_store or store_for(cfg, which=which)
         self._token: str | None = None
         self.token_file_age_days: float | None = None
         self.vault_id: str | None = None
@@ -63,32 +63,20 @@ class OnePassword:
 
     # --- substrate --------------------------------------------------------------------------
 
-    def _load_token(self):
-        p = self.cfg.secrets.token_file
-        try:
-            st = p.stat()
-            raw = p.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise SecretsError(f"token file not found at {p}",
-                               hint="put the service-account token there, mode 600") from None
-        except OSError as e:
-            raise SecretsError(f"token file unreadable at {p} ({type(e).__name__})") from None
-        mode = stat.S_IMODE(st.st_mode)
-        if mode & 0o077:
-            # see NOTES.md#token-file-mode
-            raise SecretsError(f"token file {p} is readable by other users (mode {mode:o})",
-                               hint=f"chmod 600 {p}")
-        tok = raw.strip()
-        if not tok:
-            raise SecretsError(f"token file is empty at {p}")
-        self._token = tok
-        self.token_file_age_days = round((time.time() - st.st_mtime) / 86400, 1)
-
     def check(self) -> Identity:
-        """Prove the substrate ONCE, up front: token readable, account answering, identity
+        """Prove the substrate ONCE, up front: token available, account answering, identity
         real. Anything wrong here is one root cause, not a table full of failures."""
-        self._load_token()
-        age = {"token_file_age_days": self.token_file_age_days}
+        self._token, self.token_file_age_days = self.token_store.get()
+        return self._whoami()
+
+    def verify(self, token: str) -> Identity:
+        """Prove a token BEFORE anything keeps it (NOTES.md#unlock-verifies-before-storing)."""
+        self._token, self.token_file_age_days = token, None
+        return self._whoami()
+
+    def _whoami(self) -> Identity:
+        age = ({"token_file_age_days": self.token_file_age_days}
+               if self.token_file_age_days is not None else {})
         ok, out, err = self._run("whoami", "--format", "json",
                                  timeout=max(self.cfg.secrets.timeout_s, 20))
         if ok is None:

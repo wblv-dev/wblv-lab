@@ -121,10 +121,103 @@ def test_broken_config_json(env, capsys):
 def test_valid_config_without_token_is_one_root_cause(env, capsys):
     p = default_path(env)
     p.parent.mkdir(parents=True)
-    p.write_text('[secrets]\nvault = "Lab Directory"\n', encoding="utf-8")
+    p.write_text('[secrets]\nvault = "Lab Directory"\ntoken_source = "file"\n', encoding="utf-8")
     code, out, err = run([], env, capsys)
     assert code == 1 and out == ""
     assert "secrets substrate check failed: token file not found" in err
+
+
+# --- --unlock / --lock (kernel keyring, offline) --------------------------------------------
+
+class Stdin:
+    """A piped stdin: not a TTY, one line."""
+    def __init__(self, text):
+        self._t = text
+
+    def isatty(self):
+        return False
+
+    def readline(self):
+        return self._t
+
+
+def _keyring_setup(env, whoami_fail=None):
+    from conftest import VAULT, FakeKeyctl, FakeOp
+    from wblv_lab.secrets.onepassword import OnePassword
+    from wblv_lab.secrets.tokens import KernelKeyring
+    p = default_path(env)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(f'[secrets]\nvault = "{VAULT["name"]}"\nunlock_hours = 6\n'
+                 '[membership]\nidentity_suffixes = ["/READONLY", "/LEGACY"]\n', encoding="utf-8")
+    fk = FakeKeyctl()
+    store = KernelKeyring("wblv-lab:1password", 6 * 3600, runner=fk,
+                          which=lambda _: "/usr/bin/keyctl")
+    fail = {("whoami",): whoami_fail} if whoami_fail else None
+    factory = lambda cfg: OnePassword(cfg, runner=FakeOp(fail=fail), token_store=store,
+                                      which=lambda _: "/usr/bin/op")
+    return fk, store, factory
+
+
+def test_unlock_verifies_then_holds_in_keyring(env, capsys):
+    fk, store, factory = _keyring_setup(env)
+    code = cli.main(["--unlock"], env, provider_factory=factory, stdin=Stdin('"ops_REAL_ish"\n'),
+                    token_store=store)
+    out = capsys.readouterr().out
+    assert code == 0 and "unlocked for 6h" in out and "never written to disk" in out
+    assert [v for _, v in fk.keys.values()] == ["ops_REAL_ish"]       # quotes undecorated
+    assert "ops_REAL_ish" not in out
+
+
+@pytest.mark.parametrize("given", ["hello", "ops_has space", "", "   \n"])
+def test_unlock_refuses_wrong_shape_without_storing(env, capsys, given):
+    fk, store, factory = _keyring_setup(env)
+    code = cli.main(["--unlock"], env, provider_factory=factory, stdin=Stdin(given),
+                    token_store=store)
+    err = capsys.readouterr().err
+    assert code == 1 and "nothing stored" in err and fk.keys == {}
+
+
+def test_unlock_rejected_token_is_not_stored(env, capsys):
+    fk, store, factory = _keyring_setup(env, whoami_fail=("refuse", "401 Unauthorized"))
+    code = cli.main(["--unlock"], env, provider_factory=factory, stdin=Stdin("ops_bad\n"),
+                    token_store=store)
+    err = capsys.readouterr().err
+    assert code == 1 and "not stored: token invalid or expired" in err and fk.keys == {}
+
+
+def test_run_after_unlock_then_lock(env, capsys):
+    fk, store, factory = _keyring_setup(env)
+    cli.main(["--unlock"], env, provider_factory=factory, stdin=Stdin("ops_ok\n"), token_store=store)
+    capsys.readouterr()
+    assert cli.main([], env, provider_factory=factory) == 1        # vault view (incomplete)
+    assert "Vault view only." in capsys.readouterr().out
+    assert cli.main(["--lock"], env, token_store=store) == 0
+    assert "locked — token removed" in capsys.readouterr().out and fk.keys == {}
+    assert cli.main(["--lock"], env, token_store=store) == 0
+    assert "already locked" in capsys.readouterr().out
+    assert cli.main([], env, provider_factory=factory) == 1
+    assert "the token is locked" in capsys.readouterr().err
+
+
+def test_unlock_with_file_source_is_refused(env, token_file, capsys):
+    p = default_path(env)
+    p.parent.mkdir(parents=True)
+    p.write_text(f'[secrets]\nvault = "v"\ntoken_source = "file"\ntoken_file = "{token_file}"\n',
+                 encoding="utf-8")
+    code, _, err = run(["--unlock"], env, capsys)
+    assert code == 1 and 'applies to token_source = "keyring"' in err
+
+
+def test_unlock_unconfigured(env, capsys):
+    code, _, err = run(["--unlock"], env, capsys)
+    assert code == 2 and "wblv-lab --init" in err
+
+
+@pytest.mark.parametrize("argv", [["--unlock", "--brief"], ["--unlock", "--lock"],
+                                  ["--init", "--unlock"]])
+def test_actions_are_exclusive(env, capsys, argv):
+    code, _, err = run(argv, env, capsys)
+    assert code == 1 and ("takes only" in err or "choose one of" in err)
 
 
 # --- vault view (1Password layer, offline) --------------------------------------------------
@@ -133,7 +226,8 @@ def _configured(env, token_file):
     from conftest import VAULT
     p = default_path(env)
     p.parent.mkdir(parents=True)
-    p.write_text(f'[secrets]\nvault = "{VAULT["name"]}"\ntoken_file = "{token_file}"\n'
+    p.write_text(f'[secrets]\nvault = "{VAULT["name"]}"\ntoken_source = "file"\n'
+                 f'token_file = "{token_file}"\n'
                  '[membership]\nidentity_suffixes = ["/READONLY", "/LEGACY"]\n',
                  encoding="utf-8")
 

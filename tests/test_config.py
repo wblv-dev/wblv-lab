@@ -36,18 +36,50 @@ def test_minimal_config_takes_defaults(tmp_path):
     assert cfg.source == tmp_path / "config.toml"
 
 
-def test_relative_token_file_resolves_against_config_dir(tmp_path):
+FILE_SRC = MINIMAL + 'token_source = "file"\n'
+
+
+def test_token_source_defaults_to_keyring(tmp_path):
     cfg = C.load(write(tmp_path, MINIMAL))
+    assert cfg.secrets.token_source == "keyring"
+    assert cfg.secrets.keyring_name == "wblv-lab:1password"
+    assert cfg.secrets.unlock_hours == 12
+
+
+def test_relative_token_file_resolves_against_config_dir(tmp_path):
+    cfg = C.load(write(tmp_path, FILE_SRC))
     assert cfg.secrets.token_file == tmp_path / "op-token"
-    cfg = C.load(write(tmp_path, MINIMAL + 'token_file = "sub/tok"\n'))
+    cfg = C.load(write(tmp_path, FILE_SRC + 'token_file = "sub/tok"\n'))
     assert cfg.secrets.token_file == tmp_path / "sub" / "tok"
 
 
 def test_tilde_and_absolute_token_file(tmp_path):
-    cfg = C.load(write(tmp_path, MINIMAL + 'token_file = "~/x/tok"\n'))
+    cfg = C.load(write(tmp_path, FILE_SRC + 'token_file = "~/x/tok"\n'))
     assert cfg.secrets.token_file == Path.home() / "x" / "tok"
-    cfg = C.load(write(tmp_path, MINIMAL + 'token_file = "/opt/tok"\n'))
+    cfg = C.load(write(tmp_path, FILE_SRC + 'token_file = "/opt/tok"\n'))
     assert cfg.secrets.token_file == Path("/opt/tok")
+
+
+@pytest.mark.parametrize("extra,expect", [
+    ('token_file = "tok"', 'secrets.token_file: only applies when token_source = "file" '
+                           '(it is "keyring")'),
+    ('token_source = "file"\nunlock_hours = 4',
+     'secrets.unlock_hours: only applies when token_source = "keyring" (it is "file")'),
+    ('token_source = "file"\nkeyring_name = "x"',
+     'secrets.keyring_name: only applies when token_source = "keyring" (it is "file")'),
+])
+def test_settings_for_the_other_token_source_are_refused(tmp_path, extra, expect):
+    assert problems_of(tmp_path, MINIMAL + extra + "\n") == [expect]
+
+
+@pytest.mark.parametrize("line,expect", [
+    ('token_source = "env"', "'env' is not supported (supported: keyring, file)"),
+    ("unlock_hours = 0", "outside 1..720"),
+    ('keyring_name = "has space"', "does not match the expected form"),
+])
+def test_token_source_values(tmp_path, line, expect):
+    p = problems_of(tmp_path, MINIMAL + line + "\n")
+    assert len(p) == 1 and expect in p[0]
 
 
 def test_config_is_immutable(tmp_path):
