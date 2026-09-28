@@ -5,3 +5,4 @@ __pycache__/
 op-token
 *.token
 .env
+*.egg-info/

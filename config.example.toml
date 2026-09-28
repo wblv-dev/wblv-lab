@@ -1,0 +1,57 @@
+# wblv-lab configuration
+#
+# This file says WHERE to ask, never WHAT the answer is. No addresses, hostnames or member
+# lists belong here — those come from the vault and the IPAM on every run. The loader refuses
+# anything that looks like an IP address.
+#
+# Location (first match wins; a missing file is an error, never a fall-through):
+#   --config PATH  >  $WBLV_LAB_CONFIG  >  $XDG_CONFIG_HOME/wblv-lab/config.toml
+#                                          (~/.config/wblv-lab/config.toml)
+#
+# Only [secrets].vault is required. Every other value below is the default, shown so you
+# can see what is being assumed. Remove a line to take the default; an empty value is an error.
+
+[secrets]
+provider   = "1password"
+vault      = "Lab Directory"         # exact vault name or id — never matched by substring
+token_file = "op-token"              # service-account token; relative = next to this file
+
+[membership]
+# A title qualified with "/" names one specific credential. Only these qualifiers are the
+# read-only identity; any other (e.g. "/ BACKUP") is skipped. Case and spaces ignored.
+identity_suffixes = ["/READONLY"]
+
+[membership.type_tags]               # 1Password tags that DECLARE what a member is
+physical = "physical"
+virtual  = "virtual"
+service  = "service"
+
+[fields]                             # 1Password field labels (matched forgivingly)
+dns_name = "DNS Name"
+website  = "Website"
+platform = "Platform"
+role     = "Role"
+expiry   = "Expiry Date"
+
+[ipam]
+source            = "platform:opnsense"   # the member whose Platform field says this
+hosts             = "dnsmasq"             # host reservations backend
+arp               = true                  # live address / zone / vendor from the ARP table
+router_interfaces = true                  # exclude the router's own MACs from non-members
+
+[probing]
+concurrency           = 6
+item_read_concurrency = 8
+timeout_s             = 10
+session_token         = "lab-ok"          # echoed over SSH to prove a real session
+serial_platforms      = ["synology"]      # never log in to these concurrently
+
+[faults]
+expiry_warn_days = 45
+
+[classify]
+hypervisor_vendors = ["proxmox", "vmware", "qemu", "kvm", "xen", "microsoft corporation",
+                      "oracle virtualbox", "nutanix", "parallels", "red hat"]
+
+[output]
+non_tty_columns = 200                     # width off-terminal; $COLUMNS still wins
