@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+# secrets never live in the repo
+op-token
+*.token
+.env
