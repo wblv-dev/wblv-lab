@@ -13,8 +13,12 @@ import difflib
 import ipaddress
 import os
 import re
-import tomllib
 import typing
+
+try:                                    # 3.11+
+    import tomllib
+except ModuleNotFoundError:             # 3.10 (Ubuntu 22.04): the same parser, backported
+    import tomli as tomllib
 from dataclasses import MISSING, dataclass, field, fields, is_dataclass
 from pathlib import Path
 
