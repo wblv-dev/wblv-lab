@@ -35,6 +35,15 @@ die()  { printf '\033[31mwblv-lab install:\033[0m %s\n' "$*" >&2; exit 1; }
 run()  { if [ "$DRY" = 1 ]; then printf '  [dry-run] %s\n' "$*"; else "$@"; fi; }
 CLEAN=()
 trap '[ ${#CLEAN[@]} -eq 0 ] || rm -rf "${CLEAN[@]}"' EXIT
+# apt is quiet unless it fails: its output goes to a log that is shown only on failure
+apt_q() {
+  if [ "$DRY" = 1 ]; then printf '  [dry-run] %s\n' "$*"; return 0; fi
+  local log; log="$(mktemp)"; CLEAN+=("$log")
+  if ! "$@" >"$log" 2>&1; then
+    tail -n 25 "$log" >&2
+    die "package step failed: $*"
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -130,6 +139,9 @@ ask() {  # ask "question" -> 0 yes / 1 no ; --yes answers yes; no TTY answers no
 }
 
 SUDO=""; [ "$(id -u)" = 0 ] || SUDO="sudo"
+sudo_ready() {  # ask for the password once, in plain sight, before apt output goes to a log
+  [ -z "$SUDO" ] || [ "$DRY" = 1 ] || $SUDO -v || die "sudo is needed to install packages"
+}
 
 if [ ${#missing_pkgs[@]} -gt 0 ]; then
   if [ "$NO_DEPS" = 1 ] || [ "$APT" = 0 ]; then
@@ -137,8 +149,10 @@ if [ ${#missing_pkgs[@]} -gt 0 ]; then
   fi
   if ask "Install missing packages with apt: ${missing_pkgs[*]}?"; then
     step "installing ${missing_pkgs[*]}"
-    run $SUDO apt-get update -qq
-    run $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${missing_pkgs[@]}"
+    sudo_ready
+    apt_q $SUDO apt-get update
+    apt_q $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing_pkgs[@]}"
+    say "    done"
   else
     die "missing: ${missing_pkgs[*]} — not installed (re-run with --yes, or install them yourself)"
   fi
@@ -149,7 +163,9 @@ if ! command -v op >/dev/null 2>&1; then
   if [ "$APT" = 1 ] && [ "$NO_DEPS" = 0 ] && [ "$(uname -m)" = x86_64 ] \
      && ask "The 1Password CLI (op) is not installed. Add 1Password's official apt repo and install it?"; then
     step "installing the 1Password CLI from 1Password's signed apt repository"
-    command -v gpg >/dev/null 2>&1 || run $SUDO apt-get install -y -qq --no-install-recommends gnupg
+    sudo_ready
+    command -v gpg >/dev/null 2>&1 \
+      || apt_q $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gnupg
     if [ "$DRY" = 0 ]; then
       tmp="$(mktemp)"; CLEAN+=("$tmp")
       curl -fsSL https://downloads.1password.com/linux/keys/1password.asc -o "$tmp"
@@ -158,8 +174,9 @@ if ! command -v op >/dev/null 2>&1; then
       $SUDO gpg --dearmor --yes --output /usr/share/keyrings/1password-archive-keyring.gpg "$tmp"
       echo "deb [arch=amd64 signed-by=/usr/share/keyrings/1password-archive-keyring.gpg] https://downloads.1password.com/linux/debian/amd64 stable main" \
         | $SUDO tee /etc/apt/sources.list.d/1password.list >/dev/null
-      $SUDO apt-get update -qq
-      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq 1password-cli
+      apt_q $SUDO apt-get update
+      apt_q $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y 1password-cli
+      say "    done: $(op --version 2>/dev/null || echo 'op installed')"
     else
       say "  [dry-run] fetch 1password.asc, verify fingerprint $OP_KEY_FPR, add repo, apt-get install 1password-cli"
     fi
