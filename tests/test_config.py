@@ -69,7 +69,9 @@ def test_tilde_and_absolute_token_file(tmp_path):
      'secrets.keyring_name: only applies when token_source = "keyring" (it is "file")'),
 ])
 def test_settings_for_the_other_token_source_are_refused(tmp_path, extra, expect):
-    assert problems_of(tmp_path, MINIMAL + extra + "\n") == [expect]
+    (p,) = problems_of(tmp_path, MINIMAL + extra + "\n")
+    assert p.startswith(expect)
+    assert "— remove the" in p and "line, or set token_source" in p     # says how to fix it
 
 
 @pytest.mark.parametrize("line,expect", [

@@ -237,7 +237,8 @@ def _cross_checks(data, problems):
     for key, only in _SOURCE_ONLY.items():
         if key in s and src != only:
             problems.append(f"secrets.{key}: only applies when token_source = \"{only}\" "
-                            f"(it is \"{src}\")")
+                            f"(it is \"{src}\") — remove the {key} line, or set "
+                            f"token_source = \"{only}\"")
 
 def _build(cls, data, where: str, problems: list[str], base_dir: Path) -> dict | None:
     if not isinstance(data, dict):
